@@ -715,7 +715,7 @@ Preconditions beyond the edge itself live in services:
 
 1. **The ledger is append-only and never revalued retroactively.** WAC is computed in ledger-`id` order (posting order), not `movement_date` order. A backdated entry is allowed for reporting date but does not recost history.
 2. **Issue values are frozen at posting.** Run materials cost, and so cost per packet, are sums of those frozen values. A later purchase or correction cannot change a completed run's cost.
-3. **Weighted-average computation:** `avg = SUM(value)/SUM(qty)` over the item ledger under the item lock. Issue value = `ROUND(qty × avg, 2)`; an issue that empties the item takes the remaining `SUM(value)` so no residue is left.
+3. **Weighted-average computation:** `avg = SUM(value)/SUM(qty)` over the item ledger under the item lock. Issue value = `ROUND(qty × avg, 2)`; an issue that empties the item takes the remaining `SUM(value)` so no residue is left `domain.costing.wac_issue_value` is the single implementation: it computes `qty × SUM(value) ÷ SUM(qty)` with the division last and rounds half-up to the paisa, so the average is never rounded before use and exact ties stay exact.
 4. **Corrections are forward-only transactions**, never edits:
 
 | Situation | Controlled corrective transaction |
