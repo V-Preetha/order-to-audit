@@ -19,8 +19,11 @@ def test_server_is_real_postgres(db_session):
 
 
 def test_migrations_ran_in_the_disposable_database(db_session):
+    from alembic.script import ScriptDirectory
+    from tests.db.helpers import alembic_config
+    head = ScriptDirectory.from_config(alembic_config("postgresql://unused/unused")).get_current_head()
     rows = db_session.execute(text("SELECT version_num FROM alembic_version")).all()
-    assert [r[0] for r in rows] == ["0000"]
+    assert [r[0] for r in rows] == [head]
 
 
 def test_committed_row_visible_to_second_connection(db_session, connect):

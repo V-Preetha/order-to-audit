@@ -15,7 +15,7 @@ DB_PREFIX = "o2a_test_"
 MARKER_TABLE = "_disposable_test_db"
 ADMIN_ENV = "TEST_DATABASE_ADMIN_URL"
 _LOOPBACK = {"localhost", "127.0.0.1", "::1"}
-_KEEP = {"alembic_version", MARKER_TABLE}
+_KEEP = {"alembic_version", MARKER_TABLE, "status_transitions"}  # status_transitions is migration-seeded reference data
 
 
 class UnsafeTestDatabase(RuntimeError):

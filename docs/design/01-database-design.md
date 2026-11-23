@@ -390,9 +390,11 @@ customers  id; name; customer_type CHECK IN ('retailer','distributor'); gstin ch
            CHECK (gstin IS NULL OR gstin ~ '^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$')
            CHECK (gstin IS NULL OR substr(gstin,1,2) = state_code)
            UNIQUE INDEX (gstin) WHERE gstin IS NOT NULL
-           UNIQUE (id)  -- target for typed FKs below
+           -- no separate UNIQUE (id): the primary key is already a valid foreign-key target
 suppliers  same shape without customer_type
 ```
+
+**As implemented in migration 0001** (additions the sketch above leaves implicit): every `CHECK` is named (`ck_<table>_<rule>`) so tests and error messages identify the rule that fired; `state_code` must be a GST state or UT code (01-38, 97, the same set as `domain.gst`); `settings.factory_gstin` follows the same format and state-prefix rules as customers; `products.hsn_code` is 4, 6 or 8 digits; `request_log.fingerprint` is 64 hex characters and its two `result_entity_*` columns are both set or both null; names and codes may not be blank; and `status_transitions` rejects self-edges and `(new)` as a target.
 
 ### 4.3 Recipe and BOM (pack sizes, reusable recipe)
 
