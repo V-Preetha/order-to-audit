@@ -754,6 +754,8 @@ The two layers are kept apart so a number never carries an unproven story.
 
 Run-level: `yield_variance_pct = (good − expected_output) / expected_output × 100`, `cartons_used`, `uncartoned_packets`.
 
+`domain.variance.compute_variance` is the single implementation and `v_run_consumption` must agree with it. `exceeds_tolerance` is evaluated on the exact ratio, `ABS(actual − expected) × 100 > tolerance_pct × expected`, never on the rounded display percentage, so 3.004% is flagged against a 3% tolerance although it displays as 3.00. When `expected_qty` is 0, `variance_pct` is NULL (a percentage of nothing is undefined) and any actual above 0 exceeds every tolerance. Yield and each material line are separate calculations.
+
 **Operational layer (a pure, tested function `describe_variance()`; no DB column):**
 
 - It combines the numeric facts with observations such as scrap and loose packets to produce wording.
