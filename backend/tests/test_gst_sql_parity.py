@@ -19,11 +19,11 @@ SQL_INTRA_HALF = "SELECT ROUND(CAST(:t AS numeric) * CAST(:r AS numeric) / 200, 
 SQL_INTER = "SELECT ROUND(CAST(:t AS numeric) * CAST(:r AS numeric) / 100, 2)"        # igst
 SQL_RUPEE = "SELECT ROUND(CAST(:a AS numeric), 0)"                                     # whole-rupee option
 
-# Hand-picked ties (exactly half a paisa) and near-ties, then a seeded random grid of integers.
+# Hand-picked ties (exactly half a paisa) and near-ties, then a seeded random grid covering every rate from 0.00 to 40.00.
 TIES = [
     ("0.10", "10"), ("0.10", "5"), ("0.30", "5"), ("0.50", "1"), ("1.50", "1"),
     ("333.33", "5"), ("0.09", "5"), ("0.02", "25"), ("7500.00", "5"), ("6000.00", "5"),
-    ("999999999999.99", "28"), ("0.00", "28"), ("123.45", "0"), ("100.00", "2.5"), ("100.00", "0.25"),
+    ("999999999999.99", "40"), ("999999999999.99", "28"), ("0.00", "40"), ("123.45", "0"), ("100.00", "2.5"), ("100.00", "0.25"),
 ]
 
 
@@ -31,7 +31,7 @@ def _grid():
     rng = random.Random(20261123)  # fixed seed: reproducible, no floats involved
     random_cases = [
         (str(D(rng.randint(0, 5_000_000)).scaleb(-2).quantize(D("0.01"))),
-         str(D(rng.randint(0, 2800)).scaleb(-2).quantize(D("0.01"))))
+         str(D(rng.randint(0, 4000)).scaleb(-2).quantize(D("0.01"))))
         for _ in range(400)
     ]
     return TIES + random_cases

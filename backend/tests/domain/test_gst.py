@@ -90,8 +90,8 @@ def test_fractional_rates_are_exact():
 
 
 def test_largest_storable_amount_is_exact():
-    # 999999999999.99 x 28% = 279999999999.9972 exactly, which rounds up to a whole 280000000000.00.
-    assert split_tax(D("999999999999.99"), D("28"), "inter").igst == D("280000000000.00")
+    # 999999999999.99 x 40% = 399999999999.996 exactly, which rounds up to a whole 400000000000.00.
+    assert split_tax(D("999999999999.99"), D("40"), "inter").igst == D("400000000000.00")
 
 
 # --- zero-rated and zero-value supplies ------------------------------------------------
@@ -106,10 +106,20 @@ def test_zero_value_supply_has_no_tax(supply):
 
 
 # --- invalid tax rates -----------------------------------------------------------------
-@pytest.mark.parametrize("bad", [D("-1"), D("-0.01"), D("28.01"), D("100")])
-def test_rate_outside_zero_to_28_rejected(bad):
-    with pytest.raises(InvalidTaxRate, match="between 0 and 28"):
+@pytest.mark.parametrize("bad", [D("-1"), D("-0.01"), D("40.01"), D("41"), D("100")])
+def test_rate_outside_zero_to_40_rejected(bad):
+    with pytest.raises(InvalidTaxRate, match="between 0 and 40"):
         split_tax(D("100"), bad, "intra")
+
+
+@pytest.mark.parametrize("rate", [D("0"), D("0.01"), D("28"), D("28.01"), D("39.99"), D("40"), D("40.00")])
+def test_rates_from_zero_through_forty_accepted(rate):
+    assert split_tax(D("100"), rate, "inter").igst >= 0
+
+
+def test_forty_percent_rate_splits_correctly():
+    assert split_tax(D("7500"), D("40"), "inter").igst == D("3000.00")
+    assert split_tax(D("7500"), D("40"), "intra") == TaxSplit(D("1500.00"), D("1500.00"), D("0"))
 
 
 def test_rate_with_more_than_two_decimals_rejected():

@@ -28,7 +28,7 @@ class GstError(ValueError):
 
 
 class InvalidTaxRate(GstError):
-    """The GST rate is not a Decimal between 0 and 28 with at most two decimal places."""
+    """The GST rate is not a Decimal between 0 and 40 with at most two decimal places."""
 
 
 class InvalidStateCode(GstError):
@@ -52,7 +52,7 @@ class InvalidInvoiceNumber(GstError):
 # plain Windows Python installs lack). A test compares it with the tz database where present.
 IST = timezone(timedelta(hours=5, minutes=30), "Asia/Kolkata")
 
-MAX_RATE = Decimal("28")                      # matches products.gst_rate CHECK (0..28)
+MAX_RATE = Decimal("40")                      # matches products.gst_rate CHECK (0..40); the 2025 reforms added a 40% rate
 MAX_AMOUNT = Decimal("999999999999.99")       # matches NUMERIC(14,2)
 MAX_INVOICE_NO_LENGTH = 16                    # GST invoice rules allow at most 16 characters
 # Two-digit GST state/UT codes 01-38 plus 97 (Other Territory). A format and range check,
@@ -97,7 +97,7 @@ def _decimal(value: object, name: str, error: type[GstError]) -> Decimal:
 def _rate(value: object) -> Decimal:
     rate = _decimal(value, "GST rate", InvalidTaxRate)
     if rate < 0 or rate > MAX_RATE:
-        raise InvalidTaxRate(f"GST rate must be between 0 and 28 percent, got {rate}.")
+        raise InvalidTaxRate(f"GST rate must be between 0 and 40 percent, got {rate}.")
     if rate != _CALC.quantize(rate, _PAISE):
         raise InvalidTaxRate(f"GST rate can have at most 2 decimal places, got {rate}.")
     return rate

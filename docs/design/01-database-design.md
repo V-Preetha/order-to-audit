@@ -375,7 +375,7 @@ request_log   request_id uuid PK; action text NOT NULL; fingerprint text NOT NUL
 ### 4.2 Masters
 
 ```
-products   id; name UNIQUE; hsn_code NOT NULL; gst_rate numeric(5,2) CHECK(0..28)
+products   id; name UNIQUE; hsn_code NOT NULL; gst_rate numeric(5,2) CHECK(0..40)
 
 items      id; code UNIQUE; name; kind CHECK IN ('raw','packaging','finished'); base_unit unit_code NOT NULL;
            is_active bool; product_id FK→products NULL; pack_size_g int NULL;
@@ -919,6 +919,7 @@ Numbers below are what the logic must produce. The acceptance test asserts them 
 14. Seed passwords are development-only values documented in the README test-credentials table.
 15. Tests need a real PostgreSQL (version 14 or later; Docker Compose provides 16). The harness requires `TEST_DATABASE_ADMIN_URL`, creates its own `o2a_test_<random>` database with a marker table, runs migrations there, and drops it afterwards. It refuses a non-local host, the development database server, or any database without the marker.
 16. Critical flows (ledger, reservations, production, invoicing, payments) are tested against real PostgreSQL with real commits and separate connections. Mocks, SQLite and rolled-back wrapper transactions are not used for them.
+17. The accepted GST rate range is 0 to 40 percent inclusive, with at most two decimal places: `products.gst_rate CHECK (gst_rate BETWEEN 0 AND 40)` and the same bounds in `domain.gst`. The 2025 GST reforms introduced a 40% rate, so the earlier 28% ceiling was outdated. The system validates the range only. It does not classify products into slabs and does not call any government service; the rate is master data entered per product. The benchmark rate is 5%.
 
 ## 16. Deferred (cut-line)
 
