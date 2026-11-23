@@ -42,8 +42,12 @@ def _attach(session, table):
 
 
 # ---------------------------------------------------------------- the seed
+SECTION_8_ENTITIES = tuple(ALLOWED)  # later migrations add their own entities (e.g. recipes, boms in 0002)
+_IN_SECTION_8 = "entity IN ('" + "','".join(SECTION_8_ENTITIES) + "')"
+
+
 def test_seed_matches_design_section_8_exactly(db_session):
-    rows = run(db_session, "SELECT entity, from_status, to_status FROM status_transitions").all()
+    rows = run(db_session, f"SELECT entity, from_status, to_status FROM status_transitions WHERE {_IN_SECTION_8}").all()
     assert {tuple(r) for r in rows} == set(EDGES)
     assert len(rows) == len(EDGES) == 22
 
@@ -61,7 +65,7 @@ def test_a_completed_run_is_terminal(db_session):
 
 
 def test_seed_survives_the_truncate_between_tests(db_session):
-    assert scalar(db_session, "SELECT count(*) FROM status_transitions") == 22
+    assert scalar(db_session, f"SELECT count(*) FROM status_transitions WHERE {_IN_SECTION_8}") == 22
 
 
 def test_a_status_cannot_transition_to_itself_in_the_table(db_session):

@@ -394,7 +394,7 @@ customers  id; name; customer_type CHECK IN ('retailer','distributor'); gstin ch
 suppliers  same shape without customer_type
 ```
 
-**As implemented in migration 0001** (additions the sketch above leaves implicit): every `CHECK` is named (`ck_<table>_<rule>`) so tests and error messages identify the rule that fired; `state_code` must be a GST state or UT code (01-38, 97, the same set as `domain.gst`); `settings.factory_gstin` follows the same format and state-prefix rules as customers; `products.hsn_code` is 4, 6 or 8 digits; `request_log.fingerprint` is 64 hex characters and its two `result_entity_*` columns are both set or both null; names and codes may not be blank; and `status_transitions` rejects self-edges and `(new)` as a target.
+**As implemented in migration 0001** (additions the sketch above leaves implicit): every `CHECK` is named (`ck_<table>_<rule>`) so tests and error messages identify the rule that fired; `state_code` must be a GST state or UT code (01-38, 97, the same set as `domain.gst`); `settings.factory_gstin` follows the same format and state-prefix rules as customers; `products.hsn_code` is 4, 6 or 8 digits (an application assumption, see section 15, item 18); `request_log.fingerprint` is 64 hex characters and its two `result_entity_*` columns are both set or both null; names and codes may not be blank; and `status_transitions` rejects self-edges and `(new)` as a target.
 
 ### 4.3 Recipe and BOM (pack sizes, reusable recipe)
 
@@ -418,6 +418,15 @@ bom_packaging_lines  id; bom_id FK; item_id; item_kind DEFAULT 'packaging' CHECK
 ```
 
 Active BOMs are never edited. A change creates a new version and retires the old one.
+
+**As implemented in migration 0002.** Quantities are `NUMERIC(14,3)` in the item's base unit; `recipe_lines` and `bom_packaging_lines` carry the `item_kind` witness (composite foreign key to `items(id, kind)`) and, as design 5 row 3 does for purchase lines, a `unit` witness with a composite foreign key to `items(id, base_unit)`, so an item's base unit cannot be changed underneath a frozen quantity (4.0 did not list this witness for recipe lines; the review found the gap). `boms` has `UNIQUE (sku_item_id, version)` and the partial unique index `uq_boms_one_active_per_sku`. Recipes and BOMs share one lifecycle, `(new)→draft`, `draft→active`, `draft→retired`, `active→retired`, seeded into `status_transitions` (entities `recipes` and `boms`, eight edges, in addition to section 8) and enforced by `enforce_status_transition()`. Three further trigger functions make "active BOMs are never edited" a database rule instead of a service convention:
+
+- `guard_versioned_row()`: a draft may be edited and deleted; an active row may only be retired (no other column changes); a retired row never changes; only drafts can be deleted.
+- `guard_version_lines()`: lines can be inserted, changed or deleted only while their recipe or BOM is a draft, so a retired version keeps exactly the quantities production runs were based on. It reads the parent row `FOR SHARE`, so a concurrent activation waits for an in-flight line change instead of activating on a stale view.
+- `check_activation()`: on `draft→active`, a recipe needs at least one ingredient; a BOM needs an *active* recipe and at least one packaging line (so a retired recipe cannot back a new active BOM).
+
+Replacing a BOM is therefore: insert version n+1 as a draft with its lines, retire version n, activate version n+1 (retire first, because the one-active index would otherwise reject the activation). Every recipe has its own `code` (UNIQUE, as above); a new recipe version is a new row with a new code and the next `version` number. A recipe cannot be retired while an active BOM uses it (`guard_versioned_row()` rejects it); retire the BOM first. Production runs (Task 17) reference `boms(id)`, snapshot their expected quantities, and never read a BOM's lines again, which is why retired versions only need to stay readable.
+
 
 **Interview change (500 g pack):** insert one `items` row (`kind='finished'`, `pack_size_g=500`, same `product_id`), one `boms` row pointing at the existing `recipe_id` with its own yield, and its packaging lines. No schema change.
 
@@ -697,6 +706,7 @@ invoices         (new)→issued ; issued→cancelled
 production_runs  (new)→in_progress ; in_progress→completed        -- completed is terminal
 purchases        (new)→posted ; posted→voided
 payments         (new)→posted ; posted→reversed
+recipes, boms    (new)→draft ; draft→active | retired ; active→retired   -- added by migration 0002 (section 4.3)
 ```
 
 Preconditions beyond the edge itself live in services:
@@ -924,6 +934,7 @@ Numbers below are what the logic must produce. The acceptance test asserts them 
 15. Tests need a real PostgreSQL (version 14 or later; Docker Compose provides 16). The harness requires `TEST_DATABASE_ADMIN_URL`, creates its own `o2a_test_<random>` database with a marker table, runs migrations there, and drops it afterwards. It refuses a non-local host, the development database server, or any database without the marker.
 16. Critical flows (ledger, reservations, production, invoicing, payments) are tested against real PostgreSQL with real commits and separate connections. Mocks, SQLite and rolled-back wrapper transactions are not used for them.
 17. The accepted GST rate range is 0 to 40 percent inclusive, with at most two decimal places: `products.gst_rate CHECK (gst_rate BETWEEN 0 AND 40)` and the same bounds in `domain.gst`. The 2025 GST reforms introduced a 40% rate, so the earlier 28% ceiling was outdated. The system validates the range only. It does not classify products into slabs and does not call any government service; the rate is master data entered per product. The benchmark rate is 5%.
+18. **HSN format is an application assumption, not a requirement of the NIT Trichy problem statement.** The statement gives the GST rate (5%) but no HSN code and no HSN rule. `products.hsn_code` is constrained to 4, 6 or 8 digits (`ck_products_hsn_code`) because those are the HSN lengths used on Indian GST invoices (by turnover band). The sample HSN used in seed data is a placeholder to be confirmed with the factory. The check validates shape only: it does not check that a code exists in any HSN schedule and does not call any government service. If the factory's accountant uses another convention, the single `CHECK` can be changed in a later migration without touching any other table.
 
 ## 16. Deferred (cut-line)
 

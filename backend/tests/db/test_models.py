@@ -68,7 +68,8 @@ def test_unique_constraints_and_indexes_match(inspector, table):
 @pytest.mark.parametrize("table", sorted(Base.metadata.tables))
 def test_server_defaults_and_identity_match(inspector, table):
     def norm(default):
-        return None if default is None else str(default).strip("()").replace("'", "")
+        # PostgreSQL reports a text default as 'draft'::text; compare the literal, not the cast
+        return None if default is None else str(default).split("::")[0].strip("()").replace("'", "")
     model = {c.name: (norm(c.server_default.arg if c.server_default is not None and hasattr(c.server_default, "arg") else None),
                       c.identity is not None and c.identity.always) for c in Base.metadata.tables[table].columns}
     actual = {c["name"]: (norm(c["default"]) if not c.get("identity") else None,
@@ -126,3 +127,31 @@ def test_round_trip_of_the_benchmark_masters(engine):
         assert s.scalar(select(RequestLog.created_at)) is not None
         assert s.scalar(select(Customer.state_code)) == "33"
         assert s.scalar(select(StatusTransition.entity).where(StatusTransition.to_status == "completed")) == "production_runs"
+
+
+def test_round_trip_of_the_benchmark_recipe_and_bom(engine):
+    from sqlalchemy.orm import Session
+    from app.models import Bom, BomPackagingLine, Recipe, RecipeLine
+    with Session(engine) as s:
+        product = Product(name="Murukku", hsn_code="1905", gst_rate=Decimal("5.00"))
+        s.add(product)
+        s.flush()
+        flour = Item(code="FLOUR", name="Flour", kind="raw", base_unit="kg")
+        pouch = Item(code="POUCH", name="Pouch", kind="packaging", base_unit="pc")
+        sku = Item(code="MUR-200", name="Murukku 200 g", kind="finished", base_unit="pkt", product_id=product.id,
+                   pack_size_g=200, packets_per_carton=20, list_price=Decimal("50.00"))
+        recipe = Recipe(product_id=product.id, code="MUR-R1", name="Murukku dough")
+        s.add_all([flour, pouch, sku, recipe])
+        s.flush()
+        s.add(RecipeLine(recipe_id=recipe.id, item_id=flour.id, unit="kg", qty_per_batch=Decimal("40")))
+        bom = Bom(sku_item_id=sku.id, product_id=product.id, recipe_id=recipe.id, yield_packets_per_batch=Decimal("200"))
+        s.add(bom)
+        s.flush()
+        s.add(BomPackagingLine(bom_id=bom.id, item_id=pouch.id, unit="pc", qty_per_batch=Decimal("200")))
+        s.commit()
+    with Session(engine) as s:
+        assert s.scalar(select(Recipe.status)) == "draft" and s.scalar(select(Recipe.version)) == 1
+        assert s.scalar(select(RecipeLine.item_kind)) == "raw"
+        assert s.scalar(select(Bom.sku_kind)) == "finished" and s.scalar(select(Bom.status)) == "draft"
+        assert s.scalar(select(BomPackagingLine.item_kind)) == "packaging"
+        assert s.scalar(select(Bom.yield_packets_per_batch)) == Decimal("200")
