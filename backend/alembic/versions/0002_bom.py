@@ -71,7 +71,7 @@ def upgrade() -> None:
       qty_per_batch NUMERIC(14,3) NOT NULL,
       CONSTRAINT recipe_lines_recipe_id_item_id_key UNIQUE (recipe_id, item_id),
       CONSTRAINT ck_recipe_lines_item_kind CHECK (item_kind = 'raw'),
-      CONSTRAINT ck_recipe_lines_qty_positive CHECK (qty_per_batch > 0),
+      CONSTRAINT ck_recipe_lines_qty_positive CHECK (qty_per_batch > 0 AND qty_per_batch <> 'NaN'),
       CONSTRAINT fk_recipe_lines_item_kind FOREIGN KEY (item_id, item_kind) REFERENCES items (id, kind),
       CONSTRAINT fk_recipe_lines_item_unit FOREIGN KEY (item_id, unit) REFERENCES items (id, base_unit)
     )""")
@@ -89,7 +89,7 @@ def upgrade() -> None:
       CONSTRAINT boms_id_sku_item_id_key UNIQUE (id, sku_item_id),
       CONSTRAINT boms_sku_item_id_version_key UNIQUE (sku_item_id, version),
       CONSTRAINT ck_boms_sku_kind CHECK (sku_kind = 'finished'),
-      CONSTRAINT ck_boms_yield_positive CHECK (yield_packets_per_batch > 0),
+      CONSTRAINT ck_boms_yield_positive CHECK (yield_packets_per_batch > 0 AND yield_packets_per_batch <> 'NaN'),
       CONSTRAINT ck_boms_version_positive CHECK (version >= 1),
       CONSTRAINT ck_boms_status CHECK (status IN ('draft','active','retired')),
       CONSTRAINT fk_boms_sku_kind FOREIGN KEY (sku_item_id, sku_kind) REFERENCES items (id, kind),
@@ -108,7 +108,7 @@ def upgrade() -> None:
       qty_per_batch NUMERIC(14,3) NOT NULL,
       CONSTRAINT bom_packaging_lines_bom_id_item_id_key UNIQUE (bom_id, item_id),
       CONSTRAINT ck_bom_packaging_lines_item_kind CHECK (item_kind = 'packaging'),
-      CONSTRAINT ck_bom_packaging_lines_qty_positive CHECK (qty_per_batch > 0),
+      CONSTRAINT ck_bom_packaging_lines_qty_positive CHECK (qty_per_batch > 0 AND qty_per_batch <> 'NaN'),
       CONSTRAINT fk_bom_packaging_lines_item_kind FOREIGN KEY (item_id, item_kind) REFERENCES items (id, kind),
       CONSTRAINT fk_bom_packaging_lines_item_unit FOREIGN KEY (item_id, unit) REFERENCES items (id, base_unit)
     )""")

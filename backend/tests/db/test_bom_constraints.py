@@ -571,3 +571,26 @@ def test_a_line_added_concurrently_with_activation_cannot_slip_in(db_session, m,
             other.execute(text("UPDATE boms SET status = 'active' WHERE id = :i"), {"i": bom})
     assert isinstance(caught.value.orig, pge.LockNotAvailable)
     db_session.rollback()
+
+
+# ---------------------------------------------------------------- NaN is not a quantity
+def test_recipe_line_quantity_rejects_nan(db_session, m):
+    recipe = _recipe(db_session, m["murukku"])
+    db_session.commit()
+    with violates(db_session, pge.CheckViolation, "ck_recipe_lines_qty_positive"):
+        _rline(db_session, recipe, m["flour"], "NaN")
+
+
+def test_bom_yield_rejects_nan(db_session, m):
+    recipe = _recipe(db_session, m["murukku"])
+    db_session.commit()
+    with violates(db_session, pge.CheckViolation, "ck_boms_yield_positive"):
+        _bom(db_session, m["sku200"], m["murukku"], recipe, yield_="NaN")
+
+
+def test_bom_packaging_quantity_rejects_nan(db_session, m):
+    recipe = _recipe(db_session, m["murukku"])
+    bom = _bom(db_session, m["sku200"], m["murukku"], recipe)
+    db_session.commit()
+    with violates(db_session, pge.CheckViolation, "ck_bom_packaging_lines_qty_positive"):
+        _pline(db_session, bom, m["pouch"], "NaN")

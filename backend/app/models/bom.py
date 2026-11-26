@@ -39,7 +39,7 @@ class RecipeLine(Base):
     __table_args__ = (
         UniqueConstraint("recipe_id", "item_id", name="recipe_lines_recipe_id_item_id_key"),
         CheckConstraint("item_kind = 'raw'", name="ck_recipe_lines_item_kind"),
-        CheckConstraint("qty_per_batch > 0", name="ck_recipe_lines_qty_positive"),
+        CheckConstraint("qty_per_batch > 0 AND qty_per_batch <> 'NaN'", name="ck_recipe_lines_qty_positive"),
         ForeignKeyConstraint(["item_id", "item_kind"], ["items.id", "items.kind"], name="fk_recipe_lines_item_kind"),
         ForeignKeyConstraint(["item_id", "unit"], ["items.id", "items.base_unit"], name="fk_recipe_lines_item_unit"),
     )
@@ -58,7 +58,7 @@ class Bom(Base):
         UniqueConstraint("id", "sku_item_id", name="boms_id_sku_item_id_key"),
         UniqueConstraint("sku_item_id", "version", name="boms_sku_item_id_version_key"),
         CheckConstraint("sku_kind = 'finished'", name="ck_boms_sku_kind"),
-        CheckConstraint("yield_packets_per_batch > 0", name="ck_boms_yield_positive"),
+        CheckConstraint("yield_packets_per_batch > 0 AND yield_packets_per_batch <> 'NaN'", name="ck_boms_yield_positive"),
         CheckConstraint("version >= 1", name="ck_boms_version_positive"),
         CheckConstraint("status IN ('draft','active','retired')", name="ck_boms_status"),
         ForeignKeyConstraint(["sku_item_id", "sku_kind"], ["items.id", "items.kind"], name="fk_boms_sku_kind"),
@@ -83,7 +83,7 @@ class BomPackagingLine(Base):
     __table_args__ = (
         UniqueConstraint("bom_id", "item_id", name="bom_packaging_lines_bom_id_item_id_key"),
         CheckConstraint("item_kind = 'packaging'", name="ck_bom_packaging_lines_item_kind"),
-        CheckConstraint("qty_per_batch > 0", name="ck_bom_packaging_lines_qty_positive"),
+        CheckConstraint("qty_per_batch > 0 AND qty_per_batch <> 'NaN'", name="ck_bom_packaging_lines_qty_positive"),
         ForeignKeyConstraint(["item_id", "item_kind"], ["items.id", "items.kind"], name="fk_bom_packaging_lines_item_kind"),
         ForeignKeyConstraint(["item_id", "unit"], ["items.id", "items.base_unit"], name="fk_bom_packaging_lines_item_unit"),
     )
