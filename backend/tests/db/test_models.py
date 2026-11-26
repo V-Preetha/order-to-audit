@@ -56,10 +56,11 @@ def test_check_constraint_names_match(inspector, table):
 
 @pytest.mark.parametrize("table", sorted(Base.metadata.tables))
 def test_unique_constraints_and_indexes_match(inspector, table):
-    from sqlalchemy import UniqueConstraint
+    from sqlalchemy import Column, UniqueConstraint
     t = Base.metadata.tables[table]
     model = {(c.name, tuple(col.name for col in c.columns)) for c in t.constraints if isinstance(c, UniqueConstraint)}
-    model |= {(i.name, tuple(col.name for col in i.columns)) for i in t.indexes if i.unique}
+    # an expression in an index (for example lower(...)) is reflected as None
+    model |= {(i.name, tuple(e.name if isinstance(e, Column) else None for e in i.expressions)) for i in t.indexes if i.unique}
     actual = {(u["name"], tuple(u["column_names"])) for u in inspector.get_unique_constraints(table)}
     actual |= {(i["name"], tuple(i["column_names"])) for i in inspector.get_indexes(table) if i["unique"]}
     assert model == actual
@@ -155,3 +156,46 @@ def test_round_trip_of_the_benchmark_recipe_and_bom(engine):
         assert s.scalar(select(Bom.sku_kind)) == "finished" and s.scalar(select(Bom.status)) == "draft"
         assert s.scalar(select(BomPackagingLine.item_kind)) == "packaging"
         assert s.scalar(select(Bom.yield_packets_per_batch)) == Decimal("200")
+
+
+def test_round_trip_of_the_benchmark_order_and_invoice(engine):
+    from datetime import date
+    from sqlalchemy.orm import Session
+    from app.models import CreditNote, Customer, Invoice, InvoiceLine, Order, OrderLine
+    with Session(engine) as s:
+        user = User(username="ada", full_name="Ada", password_hash="x", role="admin")
+        product = Product(name="Murukku", hsn_code="1905", gst_rate=Decimal("5.00"))
+        customer = Customer(name="Retailer A", customer_type="retailer", gstin="33AABCR1234F1Z5", state_code="33")
+        s.add_all([user, product, customer])
+        s.flush()
+        sku = Item(code="MUR-200", name="Murukku 200 g", kind="finished", base_unit="pkt", product_id=product.id,
+                   pack_size_g=200, packets_per_carton=20, list_price=Decimal("50.00"))
+        s.add(sku)
+        s.flush()
+        order = Order(order_no="ORD/0001", client_uuid="00000000-0000-0000-0000-000000000001", customer_id=customer.id,
+                      salesman_id=user.id, order_date=date(2026, 11, 20))
+        s.add(order)
+        s.flush()
+        line = OrderLine(order_id=order.id, item_id=sku.id, qty=Decimal("150"), unit_price=Decimal("50.00"))
+        s.add(line)
+        s.flush()
+        s.execute(text("UPDATE orders SET status='approved', decided_by=:u, decided_at=now() WHERE id=:o"), {"u": user.id, "o": order.id})
+        invoice = Invoice(invoice_no="INV/26-27/0001", financial_year="2026-27", invoice_seq=1, order_id=order.id, customer_id=customer.id,
+                          invoice_date=date(2026, 11, 20), seller_gstin="33AABCM1111A1Z1", seller_state_code="33",
+                          customer_name="Retailer A", customer_gstin="33AABCR1234F1Z5", customer_address="Chennai",
+                          place_of_supply_state="33", supply_type="intra", taxable_total=Decimal("7500.00"), cgst_total=Decimal("187.50"),
+                          sgst_total=Decimal("187.50"), igst_total=Decimal("0"), grand_total=Decimal("7875.00"), created_by=user.id)
+        s.add(invoice)
+        s.flush()
+        s.add(InvoiceLine(invoice_id=invoice.id, order_id=order.id, order_line_id=line.id, item_id=sku.id, description="Murukku 200 g",
+                          hsn_code="1905", qty=Decimal("150"), unit_price=Decimal("50.00"), taxable_value=Decimal("7500.00"),
+                          gst_rate=Decimal("5.00"), cgst_amount=Decimal("187.50"), sgst_amount=Decimal("187.50"),
+                          igst_amount=Decimal("0"), supply_type="intra"))
+        s.flush()
+        s.execute(text("UPDATE orders SET status='invoiced' WHERE id=:o"), {"o": order.id})
+        s.commit()
+    with Session(engine) as s:
+        assert s.scalar(select(Order.status)) == "invoiced"
+        assert s.scalar(select(Invoice.status)) == "issued" and s.scalar(select(Invoice.round_off)) == Decimal("0.00")
+        assert s.scalar(select(InvoiceLine.cgst_amount)) == Decimal("187.50")
+        assert s.scalar(select(CreditNote.id)) is None

@@ -51,6 +51,13 @@ EXPECTED_TABLES = {"users", "settings", "document_sequences", "request_log", "st
 EXPECTED_FUNCTIONS = {"unit_factor", "forbid_mutation", "enforce_status_transition", "guard_posted_row"}
 EXPECTED_TABLES_0002 = {"recipes", "recipe_lines", "boms", "bom_packaging_lines"}
 EXPECTED_FUNCTIONS_0002 = {"guard_versioned_row", "guard_version_lines", "check_activation"}
+EXPECTED_TABLES_0003 = {"orders", "order_lines", "invoices", "invoice_lines", "credit_notes"}
+EXPECTED_FUNCTIONS_0003 = {"guard_order_lines", "assert_invoice_totals", "assert_cancellation_pair", "guard_invoice_line_insert", "guard_invoice_dispatch", "guard_order_row", "check_invoice_insert", "assert_order_invoice_link", "guard_credit_note_date"}
+EXPECTED_TABLES_0004 = {"production_runs", "production_run_lines", "production_overheads"}
+EXPECTED_FUNCTIONS_0004 = {"guard_run_header", "check_run_insert", "assert_run_snapshot", "guard_run_line_insert", "guard_overhead"}
+EXPECTED_TABLES_0005 = {"purchases", "purchase_lines", "stock_adjustments", "stock_movements", "stock_reservations"}
+EXPECTED_FUNCTIONS_0005 = {"assert_stock_invariants", "assert_movement_source", "assert_source_posted", "assert_reservation_source", "guard_movement_insert",
+                           "guard_purchase_row", "guard_purchase_line_insert", "guard_reservation_row"}
 EDGES_0001, EDGES_0002 = 22, 8
 ALL_EDGES = EDGES_0001 + EDGES_0002
 
@@ -102,3 +109,70 @@ def test_0002_can_be_reversed_alone_leaving_0001_intact(fresh_url):
 
     command.upgrade(cfg, "head")
     assert _inventory(fresh_url)[3] == ALL_EDGES
+
+
+def test_0003_can_be_reversed_alone_leaving_0002_intact(fresh_url):
+    cfg = alembic_config(fresh_url)
+    command.upgrade(cfg, "0002")
+    at_0002 = _inventory(fresh_url)
+    assert not (EXPECTED_TABLES_0003 & at_0002[0])
+
+    command.upgrade(cfg, "0003")
+    tables, functions, types, seeded = _inventory(fresh_url)
+    assert EXPECTED_TABLES_0003 <= tables and EXPECTED_FUNCTIONS_0003 <= functions and seeded == ALL_EDGES
+
+    command.downgrade(cfg, "0002")
+    assert _inventory(fresh_url) == at_0002, "downgrading 0003 must restore exactly the 0002 schema and seed"
+
+    command.upgrade(cfg, "head")
+    assert EXPECTED_TABLES_0003 <= _inventory(fresh_url)[0]
+
+
+def test_0004_can_be_reversed_alone_leaving_0003_intact(fresh_url):
+    cfg = alembic_config(fresh_url)
+    command.upgrade(cfg, "0003")
+    at_0003 = _inventory(fresh_url)
+    assert not (EXPECTED_TABLES_0004 & at_0003[0])
+
+    command.upgrade(cfg, "0004")
+    tables, functions, types, seeded = _inventory(fresh_url)
+    assert EXPECTED_TABLES_0004 <= tables and EXPECTED_FUNCTIONS_0004 <= functions and seeded == ALL_EDGES
+
+    command.downgrade(cfg, "0003")
+    assert _inventory(fresh_url) == at_0003, "downgrading 0004 must restore exactly the 0003 schema and seed"
+
+    command.upgrade(cfg, "head")
+    assert EXPECTED_TABLES_0004 <= _inventory(fresh_url)[0]
+
+
+def test_0005_can_be_reversed_alone_leaving_0004_intact(fresh_url):
+    cfg = alembic_config(fresh_url)
+    command.upgrade(cfg, "0004")
+    at_0004 = _inventory(fresh_url)
+    assert not (EXPECTED_TABLES_0005 & at_0004[0])
+
+    command.upgrade(cfg, "0005")
+    tables, functions, types, seeded = _inventory(fresh_url)
+    assert EXPECTED_TABLES_0005 <= tables and EXPECTED_FUNCTIONS_0005 <= functions and seeded == ALL_EDGES
+
+    command.downgrade(cfg, "0004")
+    assert _inventory(fresh_url) == at_0004, "downgrading 0005 must restore exactly the 0004 schema and seed"
+
+    command.upgrade(cfg, "head")
+    assert EXPECTED_TABLES_0005 <= _inventory(fresh_url)[0]
+
+
+def test_0005_downgrade_leaves_no_function_behind(fresh_url):
+    """The ledger triggers belong to the ledger tables: after the downgrade no trigger or function of 0005 is left behind."""
+    cfg = alembic_config(fresh_url)
+    command.upgrade(cfg, "0005")
+    command.downgrade(cfg, "0004")
+    eng = create_engine(fresh_url)
+    try:
+        with eng.connect() as conn:
+            leftovers = conn.execute(text(
+                "SELECT proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND proname = ANY(:f)"),
+                {"f": sorted(EXPECTED_FUNCTIONS_0005)}).scalars().all()
+    finally:
+        eng.dispose()
+    assert leftovers == []

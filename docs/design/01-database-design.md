@@ -507,6 +507,32 @@ stock_reservations id; order_line_id NOT NULL UNIQUE; item_id NOT NULL; qty_base
 | production_output | + | production_run | finished | no |
 | dispatch | − | invoice_line | finished | no |
 
+### 4.5.1 As implemented in migration 0005 (deviations and honest limits)
+
+Deviations from the sketch above, each made while writing the tests:
+
+- `stock_movements.value` is not constrained to `round(qty * unit_cost)`. A purchase rate is per purchase unit, so rounding broke that identity. The CHECK is `unit_cost = round(value / qty_base, 4)`, and `value` is tied to its source document at commit only for purchase receipts (the line amount) and their reversals. Issue, scrap and count values are NOT checked against any document; the service computes them (WAC) and the database only guarantees sign, no negative value and no residue.
+- The movement-type CHECK is named `ck_stock_movements_movement_type` so that it evaluates before the sign CHECK (CHECKs run alphabetically by name).
+- Reversals exist only for dispatches and purchase receipts. A reversal row must mirror the movement it reverses exactly (item, type, negated quantity and value); it is checked by a BEFORE trigger.
+- Finished goods are quantity-only: `value` and `unit_cost` are NULL, and quantities must be whole packets.
+- One-shot postings are partial unique indexes: one receipt per purchase line, one dispatch per invoice line, one output per run, one movement per adjustment (reversal rows excluded).
+- The ledger tables, adjustments and purchase lines are append-only (UPDATE, DELETE and TRUNCATE all refused). The test harness disables the TRUNCATE guard only through `session_replication_role = replica` in its own cleanup.
+
+Honest limits:
+
+- The deferred commit-time trigger takes `FOR NO KEY UPDATE` on the item row before it reads balances, and refuses to run above READ COMMITTED. That serialises the final check for uncoordinated writers (two real-connection race tests prove exactly one commit wins). It is defence in depth, not the primary protection: WAC values and availability are computed before commit, so a writer that skips the service can still be refused late, and cannot compute a correct issue value without the lock.
+- The StockService (Tasks 12-13) must therefore still follow section 6: lock the document, then `items` rows in ascending id with `SELECT ... FOR UPDATE`, and only then read balances.
+Known weaknesses left for later tasks (found by the independent review, reported rather than hidden):
+
+- Void of a purchase is not restricted to the item's latest movement (design 9.6 rule R2): voiding an old receipt after later issues is allowed whenever stock and value stay non-negative, which can shift the WAC. Enforce in the purchasing service (Task 16).
+- A dispatch reversal is tied to a cancelled invoice but not to `credit_notes.restock`; the sales and receivables services (Tasks 18-20) must post a reversal exactly when `restock` is true.
+- Count adjustments and issue values are not tied to a cost source (a positive raw count may carry any value); the service must write the resolved WAC.
+- A reservation is checked when created; cancelling an order does not release it automatically, and a completed run is not forced to have its output movement. Services must do both.
+- The in-trigger item lock is taken in event order, so uncoordinated multi-item writers can deadlock (one is aborted; integrity is kept).
+- After a status change, `void_reason`/`voided_at` and a reservation's `closed_at` are not frozen.
+
+- Triggers do not stop a privileged role that sets `session_replication_role = replica`; the application role must not have that right.
+
 ### 4.6 Sales and invoicing
 
 ```
@@ -545,6 +571,19 @@ invoice_lines id; invoice_id FK; order_line_id NOT NULL UNIQUE; item_id; descrip
 credit_notes  id; credit_note_no UNIQUE; invoice_id NOT NULL UNIQUE; issue_date; reason NOT NULL;
               taxable_total; cgst_total; sgst_total; igst_total; grand_total; restock boolean NOT NULL
 ```
+
+**As implemented in migration 0003** (additions and differences from the sketch above):
+
+- `invoice_no` is derived, not free text: a CHECK requires it to equal `INV/YY-YY/NNNN` built from `(financial_year, invoice_seq)` (same pattern as `domain.gst.format_invoice_no`, parity-tested), at most 16 characters, unique, and `UNIQUE (financial_year, invoice_seq)`. `invoice_date` must lie inside its financial year (1 April to 31 March).
+- Supply type and tax split are database rules: `supply_type` must match `place_of_supply_state` versus `seller_state_code`; intra means `igst = 0` and `cgst = sgst`, inter means `cgst = sgst = 0`; `grand_total = taxable + cgst + sgst + igst + round_off`. `round_off` is `NUMERIC(6,2)`, at most 0.50 in magnitude and only with a whole-rupee total (paise are kept by default).
+- `invoice_lines` gained two witness columns, `order_id` and `supply_type`, with composite keys to `invoices(id, order_id, supply_type)` and `order_lines(id, order_id, item_id)`. Together they force a line to belong to its invoice's order, to repeat its item, and to share the invoice's supply type, so the per-line tax CHECK is exact. Line amounts are checked: `taxable = round(qty x price, 2)`, GST half or full `= round(taxable x rate / 200 or 100, 2)`, rate 0-40.
+- Header totals equal the sum of the lines and an invoice has at least one line: a deferred constraint trigger, so it is checked at COMMIT.
+- `credit_notes` gained `round_off`. A composite foreign key to the invoice's amounts makes a credit note a full reversal (assumption 12), and a second deferred trigger keeps "invoice cancelled" and "credit note exists" together. `invoice_lines` and `credit_notes` are append-only (`forbid_mutation`); invoices and orders cannot be deleted; invoice changes after insert are limited to `status` and dispatch fields.
+- `order_lines` carry the `item_kind` witness (finished only), quantities are whole packets (assumption added), and lines can only change while the order is `submitted` or `on_hold` (`guard_order_lines`, parent read `FOR SHARE`). Extra order CHECKs: `on_hold` needs a reason, `decided_by` and `decided_at` come as a pair, and an order past approval needs a decider.
+- Review round (a fresh reviewer found these gaps; all are now database rules): an issued invoice cannot gain lines after the transaction that issued it; dispatch is recorded once, on an issued invoice, and never rewritten or cleared; orders freeze `order_no`, `client_uuid`, `salesman_id`, `created_at` always, `customer_id` and `order_date` once past `on_hold`, and the decision (`decided_*`) once recorded; an invoice needs an order that is approved or later, and its customer name, GSTIN and place of supply must equal the customer master; an order is `invoiced` or `dispatched` exactly when it has an issued invoice (deferred, so the service moves the order to `invoiced` in the same transaction as the invoice); an invoice line repeats its order line's quantity and price (composite key) and an invoice covers every order line (deferred). The seller GSTIN is not tied to `settings` in the database; the invoicing service copies it.
+- Known limits (assumptions 19-25 in section 15): credit-note numbering has no financial-year series yet; `TRUNCATE` bypasses row-level guards, so the application role must not hold it; a total of exactly x.50 allows either rounding direction, so the service decides it. A credit note is dated on or after its invoice (`trg_credit_note_date`).
+- One invoice per order stays true even after cancellation (v1); re-invoicing a cancelled order is out of scope.
+- Nothing in 0003 writes stock; dispatch (a later migration) is the only place FG stock decreases.
 
 ### 4.7 Receivables
 
@@ -592,6 +631,17 @@ production_overheads  id; run_id FK NULL; period_month date NULL CHECK(extract(d
 
 **Actual consumption is never stored on run lines.** It is derived from the ledger: `−SUM(qty_base)` of `production_issue` + `production_scrap` for that run and item. It cannot drift from stock. Scrap is the wastage part, and yield compares `good_output_packets` with `expected_output_packets`.
 
+**As implemented in migration 0004.**
+
+- `production_run_lines` also carries a `unit` witness (composite foreign key to `items(id, base_unit)`, as in recipe lines), so an item's base unit cannot change under a frozen quantity. `item_kind` is a real column (`raw` or `packaging`) with the composite key to `items(id, kind)`, so a finished item is rejected.
+- Snapshots are enforced, not just stored. At creation, an immediate trigger requires the BOM to be `active`, `expected_output_packets = round(BOM yield x planned_batches, 3)`, and `tolerance_pct` to equal `settings.variance_tolerance_pct` (a run cannot start before the settings row exists; the seed creates it, Task 15). A deferred trigger checks at COMMIT that the lines with `expected_qty_base > 0` are exactly the BOM's recipe and packaging lines scaled by the batches (rounded to 3 decimals); a run with missing, extra or wrong planned lines cannot commit. Lines with expected 0 are unplanned material and may be added while the run is in progress; no line can be added after completion, and lines are append-only.
+- A completed run accepts no update (`guard_posted_row`); a run in progress can change only its notes and its completion fields (`guard_run_header` freezes run number, SKU, BOM, batches, expected output, tolerance and starter). A new CHECK, `ck_production_runs_in_progress_blank`, makes an in-progress run carry no output, completion time, completer or completion note (the design's iff CHECK alone allowed output without a completion time).
+- `completed_at` cannot precede `started_at`, and `voided_at` cannot precede `created_at`. Indexes on `production_runs(bom_id)` and `production_run_lines(item_id)` were added (the latter serves the ledger-derived consumption view). There is no upper plausibility bound on output quantity in the database; the service validates it. Concurrent settings changes are not locked against a run being created; the snapshot is the value read at insert.
+- Overheads: `created_at` and `created_by` were added. Only `voided_at` and `voided_by` may change, once; nothing is deleted; overheads may be recorded for a completed run. `NaN` is rejected for every quantity and amount.
+- There is no actual-consumption column. Actual consumption, scrap and good output postings come from the stock ledger (migration 0005); the 200 expected / 188 actual scenario is stored as `expected_output_packets = 200`, `good_output_packets = 188`, tolerance 3.00, with the five snapshot lines 40, 10, 1.2, 200 and 10.
+
+**Hardening applied to earlier migrations in this step (demonstrated defect).** PostgreSQL treats `NaN` as larger than every number, so `qty > 0` accepted `NaN` in `recipe_lines`, `bom_packaging_lines`, `boms.yield_packets_per_batch`, and (in 0003) order lines, invoice lines and invoice header amounts. Tests reproduced it; the CHECKs now also require `<> 'NaN'`. 0001 was not affected (its checks use `BETWEEN` or already excluded `NaN`).
+
 ### 4.9 Audit
 
 ```
@@ -611,7 +661,7 @@ PostgreSQL enforces what it can declaratively. The rest has an explicit service 
 | # | Rule | Database enforcement | Service enforcement | Test |
 |---|---|---|---|---|
 | 1 | Correct item types in recipes, BOMs, orders, purchases | Typed composite FKs with witness columns: `recipe_lines`→raw, `bom_packaging_lines`→packaging, `boms.sku`→finished, `order_lines`→finished, `production_run_lines`→raw/packaging, `purchase_lines`→raw/packaging. Ledger: `(item_kind='finished') = (value IS NULL)` and type↔kind check | Activating a BOM requires ≥1 recipe line and ≥1 packaging line | `test_recipe_line_rejects_packaging_item`, `test_bom_packaging_rejects_raw_item`, `test_order_line_rejects_raw_item`, `test_bom_activation_requires_lines` |
-| 2 | Product / SKU / BOM consistency | `boms` has `product_id` with composite FKs to both `items(id,product_id)` and `recipes(id,product_id)`, so SKU and recipe must share a product. `production_runs(bom_id, sku_item_id)` FK → `boms(id, sku_item_id)`. One active BOM per SKU (partial unique) | Run lines with `expected>0` must be exactly the BOM's lines scaled by batches. Invoice HSN/GST rate snapshot from `items.product_id`. A retired recipe cannot back a new active BOM | `test_bom_rejects_recipe_of_other_product`, `test_run_sku_must_match_bom`, `test_second_active_bom_rejected`, `test_run_lines_snapshot_matches_bom` |
+| 2 | Product / SKU / BOM consistency | `boms` has `product_id` with composite FKs to both `items(id,product_id)` and `recipes(id,product_id)`, so SKU and recipe must share a product. `production_runs(bom_id, sku_item_id)` FK → `boms(id, sku_item_id)`. One active BOM per SKU (partial unique) | Run lines with `expected>0` must be exactly the BOM's lines scaled by batches. Invoice HSN/GST rate snapshot from `items.product_id`. A retired recipe cannot back a new active BOM | `test_bom_rejects_recipe_of_other_product`, `test_run_sku_must_match_bom`, `test_second_active_bom_rejected`, `test_run_lines_are_the_bom_scaled_by_the_batches` and `test_run_lines_that_differ_from_the_bom_fail_at_commit` |
 | 3 | Valid unit conversions | `unit_code` enum; `unit_factor()` is `IMMUTABLE` and returns NULL for incompatible dimensions; the `purchase_lines` CHECK rejects NULL factors and wrong `qty_base`. Witness `base_unit` FK ties the line to the item's real base unit | Every other quantity is converted once at the service boundary by `domain.units.convert()`; the ledger accepts base units only. Carton↔packet uses `items.packets_per_carton` in the domain layer and is never stored | `test_convert_g_to_kg`, `test_convert_rejects_litre_for_kg_item`, `test_purchase_line_check_rejects_bad_qty_base`, `test_sql_and_python_unit_factors_agree` |
 | 4 | Unique posting of movements | `posting_key UNIQUE`; partial unique indexes make receipt, output, dispatch and adjustment postings structurally once-only regardless of key construction; composite FKs tie each movement's item to its source line; exactly-one-source CHECK | `INSERT … ON CONFLICT (posting_key) DO NOTHING`; if a replay's payload differs from the stored row, fail loudly | `test_duplicate_posting_key_is_noop`, `test_replay_with_different_qty_raises`, `test_second_dispatch_for_line_rejected` |
 | 5 | No negative stock | **Backstop:** deferred constraint trigger asserts `SUM(qty_base) >= 0` for the item at commit | **Guarantee:** all writers take the item lock then check on-hand in `StockService.post()`, the only code path that inserts movements | `test_issue_over_on_hand_rejected`, `test_trigger_catches_unchecked_insert`, `test_concurrent_issues_never_go_negative` |
@@ -657,6 +707,17 @@ Rules that make this correct:
 2. **Isolation stays `READ COMMITTED`.** `REPEATABLE READ` would use a stale snapshot taken before the wait.
 3. **Every writer takes the lock**, including receipts, because WAC depends on a stable `SUM(value)`/`SUM(qty)`. One function, `StockService.lock_items()`, is the only way in.
 4. **Global lock order:** the document row (order, invoice, run, payment) first, then item rows in ascending id. A single order means no deadlock cycle.
+
+### 6.1 The tolerance snapshot is also a concurrency rule (production service, Task 17)
+
+A production run copies `settings.variance_tolerance_pct` into `production_runs.tolerance_pct` when it is created. The database only checks, in a trigger at insert, that the copy equals the settings value *at that moment* (migration 0004); it cannot stop a settings update from committing between the service's read and its insert. So:
+
+1. **`start_run()` must lock the settings row in shared mode before it reads the tolerance:** `SELECT variance_tolerance_pct FROM settings WHERE id = 1 FOR SHARE`. It uses that value, read under the lock, for the snapshot, and holds the lock until the run is committed.
+2. **A settings update takes the conflicting row lock** (`UPDATE` does, or `FOR UPDATE`), so it waits for in-flight run starts and later runs see the new value. Two runs may start together (shared locks do not conflict); an update cannot interleave with a start.
+3. **Lock order:** document or master rows first, then the settings row, then item rows in ascending id (§6 rule 4). The settings lock is taken before any item lock, so it cannot form a cycle with the item locks.
+4. Named test, `test_concurrent_settings_update_cannot_produce_inconsistent_run_snapshot` in `tests/services/test_production.py`: one session starts a run and pauses holding the lock while a second session tries to change the tolerance (it must block until the first commits); after both commit, every run's `tolerance_pct` equals the settings value that was in force when its transaction took the lock.
+
+This is a requirement on the service, not something migration 0004 can provide.
 
 Rejected alternatives: `SERIALIZABLE` with retry loops (correct but harder to explain and test), and a stored `stock_levels` row with `CHECK (on_hand >= 0)` (a second source of truth that must be reconciled with the ledger).
 
@@ -798,7 +859,7 @@ All run at `READ COMMITTED`: one transaction per use case, locks in document →
 |---|---|---|---|---|
 | T1 | Seed or count-adjust stock | items | `stock_adjustments`, movement | Result negative; positive on empty stock without cost |
 | T2 | Post purchase | items | `purchases`, lines, receipt movements | Duplicate supplier invoice number |
-| T3 | Start run | bom, items | run, run-line snapshot, issue movements for materials | Insufficient stock; BOM not active |
+| T3 | Start run | bom, settings (`FOR SHARE`, §6.1), items | run, run-line snapshot, issue movements for materials | Insufficient stock; BOM not active |
 | T4 | Issue more material | run, items | run line (if unplanned), issue movements | Run not `in_progress` |
 | T5 | Complete run | run, items | `request_log`; CAS → `completed`; packaging issue + scrap; FG output | A different request on a completed run; reused request id with another payload; insufficient packaging; zero output without permission and note |
 | T6 | Submit order | none | `orders`, lines | Duplicate `client_uuid` returns the original |
@@ -935,6 +996,13 @@ Numbers below are what the logic must produce. The acceptance test asserts them 
 16. Critical flows (ledger, reservations, production, invoicing, payments) are tested against real PostgreSQL with real commits and separate connections. Mocks, SQLite and rolled-back wrapper transactions are not used for them.
 17. The accepted GST rate range is 0 to 40 percent inclusive, with at most two decimal places: `products.gst_rate CHECK (gst_rate BETWEEN 0 AND 40)` and the same bounds in `domain.gst`. The 2025 GST reforms introduced a 40% rate, so the earlier 28% ceiling was outdated. The system validates the range only. It does not classify products into slabs and does not call any government service; the rate is master data entered per product. The benchmark rate is 5%.
 18. **HSN format is an application assumption, not a requirement of the NIT Trichy problem statement.** The statement gives the GST rate (5%) but no HSN code and no HSN rule. `products.hsn_code` is constrained to 4, 6 or 8 digits (`ck_products_hsn_code`) because those are the HSN lengths used on Indian GST invoices (by turnover band). The sample HSN used in seed data is a placeholder to be confirmed with the factory. The check validates shape only: it does not check that a code exists in any HSN schedule and does not call any government service. If the factory's accountant uses another convention, the single `CHECK` can be changed in a later migration without touching any other table.
+19. **Sales quantities are whole packets.** `order_lines.qty` and `invoice_lines.qty` must be whole numbers (a CHECK), although stored as `NUMERIC(14,3)`.
+20. **One invoice per order, issued in full.** `UNIQUE (order_id)` holds even after cancellation, so a cancelled order is not re-invoiced in v1. An invoice covers every order line with the order line's quantity and price (composite key plus a commit-time check). Partial invoicing is out of scope.
+21. **Credit notes are full reversals only.** Every amount equals the invoice's (composite foreign key). The credit-note date must not precede the invoice date (trigger `trg_credit_note_date`). Cancelling leaves the order `invoiced`; creating a replacement is a later feature.
+22. **No automatic whole-rupee rounding.** Invoices keep paise (`round_off = 0` by default). The database accepts an explicit round-off of at most 0.50 only when the total is a whole rupee; the service never rounds unless an administrator turns it on, and the rounding direction at exactly x.50 is the service's choice (`domain.gst.round_grand_total`).
+23. **Issued invoices are historical snapshots.** Seller and customer details (name, GSTIN, address, place of supply) are checked against the customer master only at issue (`trg_snapshot`, `AFTER INSERT`); nothing ties an issued invoice to later master data. Editing a customer never changes, invalidates or hides an issued invoice, its credit note, its dispatch record or its payments (tests in `test_sales_constraints.py`). The seller GSTIN is copied by the invoicing service from `settings` and is not compared by the database.
+24. **Deployment must stop unauthorised `TRUNCATE`.** Row-level guards (`forbid_mutation`, `guard_posted_row`, the immutability triggers) do not fire on `TRUNCATE`. The application database role gets only `SELECT, INSERT, UPDATE` (and `DELETE` where a table allows it), never `TRUNCATE` or ownership; migrations run as a separate owner role. The Docker Compose and README deployment notes (Task 26) must say so. The disposable test databases are the only place the test harness truncates.
+25. **The full sales path is tested in SQL now, in the service later.** Approved order -> invoice -> order `invoiced`, and invoice -> full credit note -> `cancelled`, are exercised end to end with every trigger enabled in `test_sales_constraints.py`. Task 19 (InvoiceService) will add the same flows through application code, numbering and idempotency; no service code exists yet.
 
 ## 16. Deferred (cut-line)
 

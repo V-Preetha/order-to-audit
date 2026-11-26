@@ -67,4 +67,6 @@ def truncate_disposable(engine: Engine) -> None:
         targets = [t for t in tables if t not in _KEEP]
         if targets:
             names = ", ".join(f'"{t}"' for t in targets)
+            # The ledger tables refuse TRUNCATE through a trigger; the replica role (superuser, this transaction only) skips user triggers.
+            conn.execute(text("SET LOCAL session_replication_role = replica"))
             conn.execute(text(f"TRUNCATE {names} RESTART IDENTITY CASCADE"))
