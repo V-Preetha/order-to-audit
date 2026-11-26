@@ -214,6 +214,18 @@ Backend foundations come first. Once the user approves the UI design direction, 
 - [ ] **Step 2: Run** → FAIL. **Step 3: Implement** per §4.7, §4.9, §5 rule 7. **Step 4: Run** → PASS.
 - [ ] **Step 5: Commit checkpoint** — `feat(db): payments, allocations and audit log`.
 
+### Obligations carried from the Task 10 review (binding on the tasks named; the database does not provide them)
+
+The ledger migration (0005) enforces shape, sign, source agreement, one-shot postings, immutability and a commit-time balance check. It does NOT replace these service duties, and each task below must have a test for its item:
+
+| Task | Obligation | Required test (name) |
+|------|------------|----------------------|
+| 12 / 13 | Lock `items` rows in ascending id with `SELECT ... FOR UPDATE` before reading any balance (design 6); post issue, scrap and count values from the single WAC function, and write the resolved WAC as `unit_cost` on every positive raw/packaging count | `test_items_are_locked_in_ascending_id_order`; `test_count_adjustment_carries_resolved_wac` |
+| 16 | A purchase may be voided only if each receipt is the item's latest movement (design 9.6 rule R2); otherwise refuse with a clear error | `test_void_refused_when_later_movements_exist` |
+| 18 (sales cancellation) | Cancelling or rejecting an order releases its active reservations in the same transaction | `test_cancelling_an_order_releases_its_reservations` |
+| 19 (invoice cancellation) | Post a dispatch reversal exactly when the credit note's `restock` is true, and none when false | `test_restock_flag_decides_dispatch_reversal` |
+| 17 (production service) | Completing a run posts the finished-goods output movement in the same transaction (a completed run without its output must be impossible) | `test_completing_a_run_posts_output_atomically` |
+
 ### Task 12: StockService — core posting, balances, WAC, idempotency
 
 **Files:** Create `backend/app/services/stock.py`, `backend/app/services/idempotency.py`, `backend/tests/services/test_stock_core.py`, `backend/tests/services/test_idempotency.py`, `backend/tests/factories.py` (`make_item`, `make_user`)

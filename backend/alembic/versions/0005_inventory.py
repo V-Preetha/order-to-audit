@@ -242,6 +242,9 @@ def upgrade() -> None:
       END IF;
       FOR col IN SELECT n.key FROM jsonb_each(to_jsonb(NEW)) AS n JOIN jsonb_each(to_jsonb(OLD)) AS o ON o.key = n.key
                  WHERE n.value IS DISTINCT FROM o.value ORDER BY n.key LOOP
+        IF OLD.status = 'voided' THEN
+          RAISE EXCEPTION USING ERRCODE = 'restrict_violation', MESSAGE = 'a voided purchase cannot be changed (column ' || col || ')';
+        END IF;
         IF col NOT IN ('status', 'voided_at', 'voided_by', 'void_reason') THEN
           RAISE EXCEPTION USING ERRCODE = 'restrict_violation', MESSAGE = 'purchases column ' || col || ' cannot be changed once posted';
         END IF;
@@ -273,6 +276,9 @@ def upgrade() -> None:
       END IF;
       FOR col IN SELECT n.key FROM jsonb_each(to_jsonb(NEW)) AS n JOIN jsonb_each(to_jsonb(OLD)) AS o ON o.key = n.key
                  WHERE n.value IS DISTINCT FROM o.value ORDER BY n.key LOOP
+        IF OLD.status <> 'active' THEN
+          RAISE EXCEPTION USING ERRCODE = 'restrict_violation', MESSAGE = 'a closed reservation cannot be changed (column ' || col || ')';
+        END IF;
         IF col NOT IN ('status', 'closed_at') THEN
           RAISE EXCEPTION USING ERRCODE = 'restrict_violation', MESSAGE = 'stock_reservations column ' || col || ' cannot be changed';
         END IF;

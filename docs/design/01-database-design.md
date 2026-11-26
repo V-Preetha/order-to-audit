@@ -522,14 +522,18 @@ Honest limits:
 
 - The deferred commit-time trigger takes `FOR NO KEY UPDATE` on the item row before it reads balances, and refuses to run above READ COMMITTED. That serialises the final check for uncoordinated writers (two real-connection race tests prove exactly one commit wins). It is defence in depth, not the primary protection: WAC values and availability are computed before commit, so a writer that skips the service can still be refused late, and cannot compute a correct issue value without the lock.
 - The StockService (Tasks 12-13) must therefore still follow section 6: lock the document, then `items` rows in ascending id with `SELECT ... FOR UPDATE`, and only then read balances.
-Known weaknesses left for later tasks (found by the independent review, reported rather than hidden):
+Obligations the database cannot provide, now binding on the services (full table with required test names in the implementation plan, "Obligations carried from the Task 10 review"):
 
-- Void of a purchase is not restricted to the item's latest movement (design 9.6 rule R2): voiding an old receipt after later issues is allowed whenever stock and value stay non-negative, which can shift the WAC. Enforce in the purchasing service (Task 16).
-- A dispatch reversal is tied to a cancelled invoice but not to `credit_notes.restock`; the sales and receivables services (Tasks 18-20) must post a reversal exactly when `restock` is true.
-- Count adjustments and issue values are not tied to a cost source (a positive raw count may carry any value); the service must write the resolved WAC.
-- A reservation is checked when created; cancelling an order does not release it automatically, and a completed run is not forced to have its output movement. Services must do both.
+- Tasks 12-13: deterministic item-lock order (ascending id) and correct WAC posting, including a resolved `unit_cost` on every positive raw/packaging count (the database does not tie issue, scrap or count values to a cost source).
+- Task 16: a purchase void is allowed only when each receipt is the item's latest movement (rule R2, 9.6).
+- Sales cancellation: release the order's active reservations in the same transaction (a reservation is checked when created; cancelling an order does not release it by itself).
+- Invoice cancellation: post a dispatch reversal exactly when `credit_notes.restock` is true.
+- Production service (Task 17): completing a run must atomically post the finished-goods output movement.
+- Transition timestamps (`voided_at`, `closed_at`, and `production_runs.completed_at`) and `created_at` of purchases, reservations and adjustments are supplied by the writer, not stamped by the database (only movement `created_at` is). The services must write `now()`; stamping them in BEFORE triggers is a candidate hardening.
+- The application role must not own the tables (an owner can `DISABLE TRIGGER`); a future BEFORE UPDATE trigger must sort before `trg_2_guard`.
 - The in-trigger item lock is taken in event order, so uncoordinated multi-item writers can deadlock (one is aborted; integrity is kept).
-- After a status change, `void_reason`/`voided_at` and a reservation's `closed_at` are not frozen.
+
+Fixed in the Task 10 correction step: once a purchase is voided, or a reservation is closed, none of its columns (`void_reason`, `voided_at`, `voided_by`, `closed_at`, ...) can change.
 
 - Triggers do not stop a privileged role that sets `session_replication_role = replica`; the application role must not have that right.
 

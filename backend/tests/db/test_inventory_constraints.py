@@ -8,6 +8,7 @@ rows (a dispatch matches its invoice line, a purchase line has its receipt) also
 Fixtures commit master data because `violates()` rolls the session back after an expected error.
 """
 import threading
+import time
 from datetime import date, timedelta
 from decimal import Decimal
 
@@ -626,7 +627,7 @@ def test_movement_item_kind_must_be_the_items_real_kind(db_session, x):
 
 
 def test_a_movement_needs_a_source_that_exists(db_session, x):
-    with violates(db_session, pge.ForeignKeyViolation):
+    with violates(db_session, pge.ForeignKeyViolation, "fk_stock_movements_purchase_line_item"):
         _mv(db_session, x, "k", x["flour"], "purchase_receipt", "5", value="210.00", cost="42", purchase_line_id=99999)
 
 
@@ -753,10 +754,31 @@ def test_reversal_is_unique(db_session, x):
 
 
 def test_reversal_must_be_same_item(db_session, x):
-    invoice, line, original = _reversible_dispatch(db_session, x)
-    other_sku = scalar(db_session, "SELECT id FROM items WHERE code = 'MIX-200'")
-    with violates(db_session, pge.ForeignKeyViolation):
-        _mv(db_session, x, "rev", other_sku, "dispatch", "150", invoice_line_id=line, reverses_movement_id=original)
+    """The mirror trigger is the first layer (it also compares the source), so it is disabled INSIDE this test's transaction (rolled
+    back afterwards) to show that the reversal foreign key on its own refuses a movement of a different item. The reversal row is
+    valid at statement level: its own purchase line, type, and mirrored quantity and value."""
+    pid, (flour_line, oil_line) = _purchase(db_session, x, lines=(("flour", "100", "42"), ("oil", "100", "140")))
+    db_session.commit()      # no pending deferred checks, so the trigger can be disabled for this transaction only
+    original = scalar(db_session, "SELECT id FROM stock_movements WHERE purchase_line_id = :l", l=flour_line)
+    run(db_session, "ALTER TABLE stock_movements DISABLE TRIGGER trg_mirror")
+    with violates(db_session, pge.ForeignKeyViolation, "fk_stock_movements_reverses"):
+        _mv(db_session, x, "rev-wrong-item", x["oil"], "purchase_receipt", "-100", value="-14000.00", purchase_line_id=oil_line, reverses_movement_id=original)
+
+
+def test_with_the_mirror_trigger_in_place_a_wrong_item_reversal_is_refused_first_by_the_mirror(db_session, x):
+    pid, (flour_line, oil_line) = _purchase(db_session, x, lines=(("flour", "100", "42"), ("oil", "100", "140")))
+    run(db_session, "UPDATE purchases SET status = 'voided', voided_at = now(), voided_by = :u, void_reason = 'x' WHERE id = :p", u=x["u"], p=pid)
+    original = scalar(db_session, "SELECT id FROM stock_movements WHERE purchase_line_id = :l", l=flour_line)
+    with violates(db_session, pge.CheckViolation, message="exact mirror"):
+        _mv(db_session, x, "rev-wrong-item", x["oil"], "purchase_receipt", "-100", value="-14000.00", purchase_line_id=oil_line, reverses_movement_id=original)
+
+
+def test_control_a_same_item_reversal_passes_the_statement_level_checks(db_session, x):
+    """Control for the test above: the same reversal naming the right item's movement is accepted at statement level."""
+    pid, (flour_line, oil_line) = _purchase(db_session, x, lines=(("flour", "100", "42"), ("oil", "100", "140")))
+    run(db_session, "UPDATE purchases SET status = 'voided', voided_at = now(), voided_by = :u, void_reason = 'x' WHERE id = :p", u=x["u"], p=pid)
+    original = scalar(db_session, "SELECT id FROM stock_movements WHERE purchase_line_id = :l", l=oil_line)
+    _mv(db_session, x, "rev-right-item", x["oil"], "purchase_receipt", "-100", value="-14000.00", purchase_line_id=oil_line, reverses_movement_id=original)
 
 
 def test_a_reversal_must_be_a_mirror_of_the_original(db_session, x):
@@ -1099,30 +1121,78 @@ def test_the_stock_trigger_refuses_to_run_above_read_committed(engine, db_sessio
         conn.close()
 
 
-def _race(engine, *work):
-    """Run each `work(conn)` in its own connection and transaction; all of them commit at the same moment. Returns 'ok' or the exception."""
-    barrier = threading.Barrier(len(work))
-    outcome = [None] * len(work)
+def _classify(exc, expected_messages):
+    """'rejected' only for the inventory rule the test is about (SQLSTATE 23514 with its message); anything else stays an exception."""
+    original = getattr(exc, "orig", exc)
+    if isinstance(original, pge.CheckViolation) and any(m in str(original) for m in expected_messages):
+        return "rejected"
+    return exc
 
-    def worker(index, fn):
+
+def _overlapping_commits(engine, first, second, expected_messages):
+    """Two real connections whose commit-time checks MUST overlap.
+
+    `first` runs and its commit-time check is forced early (SET CONSTRAINTS ALL IMMEDIATE), so it holds the item row lock while its
+    transaction is still open. `second` then does its work and commits; it can only get past its own check by waiting for that lock.
+    The test fails unless `second` is seen waiting on a lock (so the lock is what serialises, not luck), and then `first` commits.
+
+    Returns (outcomes, second_was_blocked); an outcome is 'ok', 'rejected' (the expected inventory rule) or the unexpected exception.
+    """
+    outcome = {}
+    state = {"pid": None, "first_pid": None, "blocked": False}
+    pid_ready = threading.Event()
+    lock_held = threading.Event()
+
+    def first_worker():
         conn = engine.connect()
         try:
-            fn(conn)
-            barrier.wait(timeout=20)
+            conn.execute(text("SET lock_timeout = '20s'"))
+            state["first_pid"] = conn.execute(text("SELECT pg_backend_pid()")).scalar()
+            first(conn)
+            conn.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))   # runs the invariant check now and takes the item lock
+            lock_held.set()
+            if not pid_ready.wait(timeout=20):
+                raise TimeoutError("second connection never started")
+            with engine.connect() as probe:
+                for _ in range(150):                                  # up to 15 s
+                    # the second backend must be blocked BY the first one (not by some other lock)
+                    if probe.execute(text("SELECT :f = ANY(pg_blocking_pids(:s))"), dict(f=state["first_pid"], s=state["pid"])).scalar():
+                        state["blocked"] = True
+                        break
+                    time.sleep(0.1)
             conn.commit()
-            outcome[index] = "ok"
-        except Exception as exc:  # noqa: BLE001 - the exception IS the result
-            outcome[index] = exc
+            outcome["first"] = "ok"
+        except Exception as exc:  # noqa: BLE001 - classified, never swallowed
             conn.rollback()
+            outcome["first"] = _classify(exc, expected_messages)
         finally:
+            lock_held.set()
             conn.close()
 
-    threads = [threading.Thread(target=worker, args=(i, fn)) for i, fn in enumerate(work)]
+    def second_worker():
+        lock_held.wait(timeout=20)          # the first transaction demonstrably holds the lock before the second starts
+        conn = engine.connect()
+        try:
+            conn.execute(text("SET lock_timeout = '20s'"))
+            state["pid"] = conn.execute(text("SELECT pg_backend_pid()")).scalar()
+            pid_ready.set()
+            second(conn)
+            conn.commit()
+            outcome["second"] = "ok"
+        except Exception as exc:  # noqa: BLE001
+            conn.rollback()
+            outcome["second"] = _classify(exc, expected_messages)
+        finally:
+            pid_ready.set()
+            conn.close()
+
+    threads = [threading.Thread(target=first_worker), threading.Thread(target=second_worker)]
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=60)
-    return outcome
+        t.join(timeout=90)
+    assert not any(t.is_alive() for t in threads), "a race worker is still running (a lock was never released)"
+    return outcome, state["blocked"]
 
 
 def test_two_uncoordinated_reservations_cannot_both_commit(engine, db_session, x):
@@ -1141,9 +1211,14 @@ def test_two_uncoordinated_reservations_cannot_both_commit(engine, db_session, x
                          dict(o=line, i=x["sku"], u=x["ada"]))
         return work
 
-    outcome = _race(engine, reserve(a), reserve(b))
-    assert sorted("ok" if o == "ok" else "refused" for o in outcome) == ["ok", "refused"], outcome
+    outcome, blocked = _overlapping_commits(engine, reserve(a), reserve(b), ["active reservations exceed on-hand stock"])
+    assert blocked, f"the second commit never waited on the item lock, so nothing proves the lock serialises the checks: {outcome}"
+    assert outcome == {"first": "ok", "second": "rejected"}, outcome
+    # committed state: one reservation, within on-hand
+    assert scalar(db_session, "SELECT count(*) FROM stock_reservations") == 1
+    assert scalar(db_session, "SELECT order_line_id FROM stock_reservations") == a     # the transaction that held the lock first won
     assert scalar(db_session, "SELECT coalesce(sum(qty_base), 0) FROM stock_reservations WHERE status = 'active'") == D("60.000")
+    assert scalar(db_session, "SELECT coalesce(sum(qty_base), 0) FROM stock_movements WHERE item_id = :i", i=x["sku"]) == D("88.000")
 
 
 def test_two_uncoordinated_issues_cannot_both_commit(engine, db_session, x):
@@ -1157,9 +1232,20 @@ def test_two_uncoordinated_issues_cannot_both_commit(engine, db_session, x):
                               "VALUES (:k, :i, 'raw', :d, 'production_issue', -60, 42, -2520, :u, :r)"), dict(k=key, i=x["flour"], d=D0, u=x["u"], r=run_id))
         return work
 
-    outcome = _race(engine, issue(first, "r1"), issue(second, "r2"))
-    assert sorted("ok" if o == "ok" else "refused" for o in outcome) == ["ok", "refused"], outcome
+    outcome, blocked = _overlapping_commits(engine, issue(first, "r1"), issue(second, "r2"), ["negative stock for item"])
+    assert blocked, f"the second commit never waited on the item lock, so nothing proves the lock serialises the checks: {outcome}"
+    assert outcome == {"first": "ok", "second": "rejected"}, outcome
+    # committed state: exactly one issue posted, balance and value consistent, no partial row from the loser
     assert _balance(db_session, x["flour"]) == (D("40.000"), D("1680.00"))
+    assert scalar(db_session, "SELECT array_agg(posting_key) FROM stock_movements WHERE posting_key IN ('r1', 'r2')") == ["r1"]
+
+
+def test_an_unexpected_error_is_not_reported_as_a_rejection():
+    """The classifier is strict: a deadlock or any other database error must fail the race tests, not satisfy them."""
+    assert _classify(RuntimeError("boom"), ["negative stock"]) != "rejected"
+    assert _classify(pge.DeadlockDetected("negative stock"), ["negative stock"]) != "rejected"
+    assert _classify(pge.CheckViolation("some other check"), ["negative stock"]) != "rejected"
+    assert _classify(pge.CheckViolation("negative stock for item 1"), ["negative stock"]) == "rejected"
 
 
 # ---------------------------------------------------------------- indexes for balances, transactions and audit reports
@@ -1259,3 +1345,39 @@ def test_a_forged_created_at_cannot_backdate_an_issue_to_a_completed_run(db_sess
         d=D0, r=run_id, u=x["u"], i=x["flour"])
     with violates(db_session, pge.CheckViolation, message="already completed"):
         db_session.commit()
+
+
+# ---- lifecycle metadata is history: once voided or closed it cannot be rewritten
+@pytest.mark.parametrize("assignment", ["void_reason = 'rewritten'", "voided_at = voided_at + interval '1 day'", "voided_by = created_by + 0"])
+def test_a_voided_purchase_keeps_its_void_metadata(db_session, x, assignment):
+    pid, _ = _purchase(db_session, x)
+    other = scalar(db_session, "SELECT id FROM users WHERE id <> :u LIMIT 1", u=x["u"]) if assignment.startswith("voided_by") else None
+    db_session.commit()
+    _void(db_session, x, pid)
+    db_session.commit()
+    if other is not None:
+        assignment = f"voided_by = {other}"
+    with violates(db_session, pge.RestrictViolation, message="voided purchase"):
+        run(db_session, f"UPDATE purchases SET {assignment} WHERE id = :p", p=pid)
+
+
+def test_voiding_still_works_and_an_unchanged_voided_row_may_be_touched(db_session, x):
+    pid, _ = _purchase(db_session, x)
+    db_session.commit()
+    _void(db_session, x, pid)
+    db_session.commit()
+    run(db_session, "UPDATE purchases SET void_reason = void_reason WHERE id = :p", p=pid)   # no change, no error
+    db_session.commit()
+    assert scalar(db_session, "SELECT status FROM purchases WHERE id = :p", p=pid) == "voided"
+
+
+@pytest.mark.parametrize("final", ["fulfilled", "released"])
+def test_a_closed_reservation_keeps_its_closing_time(db_session, x, final):
+    _open(db_session, x, x["sku"], "238")
+    _, oline = _approved_line(db_session, x, "50")
+    rid = _reserve(db_session, x, oline, "50")
+    db_session.commit()
+    run(db_session, "UPDATE stock_reservations SET status = :s, closed_at = now() WHERE id = :r", s=final, r=rid)
+    db_session.commit()
+    with violates(db_session, pge.RestrictViolation, message="closed reservation"):
+        run(db_session, "UPDATE stock_reservations SET closed_at = closed_at + interval '1 day' WHERE id = :r", r=rid)
