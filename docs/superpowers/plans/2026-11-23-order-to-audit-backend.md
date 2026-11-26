@@ -227,6 +227,18 @@ The ledger migration (0005) enforces shape, sign, source agreement, one-shot pos
 | 14 / 20 (audit and payment services) | Write the `audit_log` entry in the SAME transaction as the audited change; lock the payment and invoice rows `FOR UPDATE` in ascending id order before allocating; reverse a payment (never delete) before cancelling an invoice that has allocations | `test_audit_entry_is_written_in_the_same_transaction`; `test_payment_service_locks_payment_then_invoice_in_id_order`; `test_invoice_cancel_requires_payment_reversal_first` |
 | 17 (production service) | Completing a run posts the finished-goods output movement in the same transaction (a completed run without its output must be impossible) | `test_completing_a_run_posts_output_atomically` |
 
+### Task 12 as built (rulings; the interface above is otherwise unchanged)
+
+- `post(qty=...)` takes a **positive magnitude** for every movement type; the service applies the sign (issue, scrap and dispatch reduce stock). Only `count_adjustment` takes a signed quantity.
+- `lock_items` uses `FOR NO KEY UPDATE` (not `FOR UPDATE`): it still excludes every other stock writer, including the commit-time triggers, but does not block unrelated foreign-key checks on the item.
+- A repeated posting key is checked **before** balances, so replaying an issue after the stock has run out returns the original movement instead of failing.
+- Extra exceptions: `CostRequired`, `InvalidPosting`, `UnknownItem`; `InsufficientStock` is the one class from `domain.costing`. Quantities with more than 3 decimals, non-finite values, and fractional finished goods are refused before any SQL runs.
+- `tests/factories.py` was not created: the existing builders in `tests/db` already provide items and users.
+- A purchase receipt takes its quantity and **value from the purchase line** (its amount is in the purchase unit, and no 4-decimal cost can reproduce it for, say, 1 kg bought at 42.37 for an item counted in grams). `unit_cost` is optional for receipts and, if given, must reproduce the line amount.
+- Movement type must suit the item kind, a source can be posted once (a second posting under another key is a `PostingMismatch`), values beyond NUMERIC(14,2) and non-integer ids or non-date dates are refused in the service, and posting requires READ COMMITTED.
+- Task 13 additions: `reserve(..., user_id)` (the ledger needs `created_by`); a **dispatch consumes its own order's reservation inside `post`** (it may count it as free, so it must also close it); `post` refuses reductions of finished goods that would eat into other orders' reservations (`InsufficientStock`); `reverse` always applies the "latest movement" rule to purchase receipts, whatever `require_latest` says.
+- **Still the services' job (database backs it up at COMMIT):** the service does not re-read the source document (adjustment qty/cost, invoice status, run state, order-line qty). Tasks 16–19 create those rows in the same transaction with matching values; a mismatch fails at commit with a database error rather than a domain error. `reverse()` has no ON CONFLICT handling for the same key used concurrently on another item, and its date is the server's `current_date`.
+
 ### Task 12: StockService — core posting, balances, WAC, idempotency
 
 **Files:** Create `backend/app/services/stock.py`, `backend/app/services/idempotency.py`, `backend/tests/services/test_stock_core.py`, `backend/tests/services/test_idempotency.py`, `backend/tests/factories.py` (`make_item`, `make_user`)
