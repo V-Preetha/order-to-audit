@@ -529,7 +529,7 @@ Obligations the database cannot provide, now binding on the services (full table
 - Sales cancellation: release the order's active reservations in the same transaction (a reservation is checked when created; cancelling an order does not release it by itself).
 - Invoice cancellation: post a dispatch reversal exactly when `credit_notes.restock` is true.
 - Production service (Task 17): completing a run must atomically post the finished-goods output movement.
-- Transition timestamps (`voided_at`, `closed_at`, and `production_runs.completed_at`) and `created_at` of purchases, reservations and adjustments are supplied by the writer, not stamped by the database (only movement `created_at` is). The services must write `now()`; stamping them in BEFORE triggers is a candidate hardening.
+- Audit timestamps are stamped by the database (`created_at` of movements, purchases, reservations and adjustments; `voided_at` on posted->voided; `closed_at` on active->closed; a client-supplied value is overwritten). Business dates (`purchase_date`, `adjustment_date`, `movement_date`) stay as entered. Still writer-supplied: `production_runs.completed_at` (migration 0004, out of scope of this correction), which the late-issue check in `assert_movement_source` relies on.
 - The application role must not own the tables (an owner can `DISABLE TRIGGER`); a future BEFORE UPDATE trigger must sort before `trg_2_guard`.
 - The in-trigger item lock is taken in event order, so uncoordinated multi-item writers can deadlock (one is aborted; integrity is kept).
 
@@ -605,6 +605,26 @@ payment_allocations id; payment_id; invoice_id; customer_id NOT NULL; amount num
 
 Outstanding per invoice is `grand_total − SUM(allocations from posted payments)`, and 0 once a credit note exists. Ageing buckets (0–30, 31–60, 61–90, 90+) are computed from `invoice_date`.
 
+### 4.7.1 As implemented in migration 0006
+
+- Money is `NUMERIC(14,2)`, strictly positive, NaN rejected; paise are kept exactly (benchmark: 7,875.00 - 4,000.00 = 3,875.00).
+- Allocations are tied to one customer by two composite foreign keys (`fk_payment_allocations_payment_customer`, `fk_payment_allocations_invoice_customer`), so a payment, an allocation and an invoice can never cross customers.
+- A deferred constraint trigger (`assert_allocation_limits`, per allocation, at COMMIT) asserts: the payment is `posted`, the invoice is `issued`, `SUM(allocations of the payment) <= payment.amount`, and `SUM(allocations from posted payments to the invoice) <= invoice.grand_total`. It locks the payment row, then the invoice row (`FOR NO KEY UPDATE`), reads the sums in later statements, and refuses to run above READ COMMITTED. Like the stock trigger this is defence in depth: the payment service must still lock the payment and invoice `FOR UPDATE` in ascending id order first (section 6). Uncoordinated writers that lock in opposite order can deadlock; one is aborted and integrity is kept.
+- A second deferred trigger on `invoices` (`assert_invoice_not_settled`) refuses to cancel an invoice that still has allocations from posted payments (section 11: reverse the payment first).
+- Payments are never deleted. Lifecycle is `posted -> reversed` once; `reversed_at` is stamped by the database; a reversed payment is frozen; its allocations stay as history and stop counting (a reversed payment frees invoice capacity). Payments get their own guard (`guard_payment_row`) because `guard_posted_row` from migration 0001 only allows columns beginning `reversed_`, which does not cover the design's `reverse_reason` (reported, not changed in 0001).
+- `payment_allocations` and `audit_log` are append-only (UPDATE, DELETE, TRUNCATE refused); `created_at` / `occurred_at` are stamped by the database; `payment_date` is a business date and is kept as entered.
+- `audit_log`: `user_id` nullable (system actions), `entity_type` + `entity_id` required, `before`/`after` JSON objects or NULL, optional `request_id`; the service writes the entry in the same transaction as the change.
+
+Honest limits of migration 0006 (from the independent review; none lets a non-owner role break an allocation rule with plain SQL):
+
+- Role separation is NOT created by any migration. The guards stop a role that only has ordinary INSERT/UPDATE rights; a table owner can `ALTER TABLE ... DISABLE TRIGGER`, and a superuser (or, on PostgreSQL 15+, a role granted it) can set `session_replication_role = replica`. Deployment must connect the application as a separate role that does not own the tables (narrow grants are a deployment task; `FOR NO KEY UPDATE` in the trigger needs UPDATE privilege on `payments` and `invoices` for any role that inserts allocations).
+- The database does not write audit entries: a reversal or cancellation committed without the service leaves no audit row, and `reversed_by` / `user_id` are whatever the writer supplies. The service writes the entry in the same transaction (Task 14). Database-written audit rows (AFTER triggers with a required session user) are a possible later hardening.
+- `occurred_at` is the wall clock (`clock_timestamp()`); other stamped times are the transaction time (`now()`), so a long transaction shares one value. Order the audit log by `(occurred_at, id)`: `OVERRIDING SYSTEM VALUE` lets a privileged writer choose an id.
+- `NUMERIC(14,2)` silently rounds extra decimals (`4000.005` becomes `4000.01`); the service must validate that money input has at most two decimals. NaN and Infinity are rejected.
+- `assert_invoice_not_settled` fires on any `UPDATE OF status` on invoices; under REPEATABLE READ even an update that leaves the status unchanged is refused (the application runs READ COMMITTED).
+
+Not provided by the database (service duties, Tasks 14 and 20): who may record or reverse a payment (RBAC), payment numbering, automatic splitting of one payment across invoices, and writing the audit entries.
+
 ### 4.8 Production
 
 ```
@@ -670,20 +690,20 @@ PostgreSQL enforces what it can declaratively. The rest has an explicit service 
 | 4 | Unique posting of movements | `posting_key UNIQUE`; partial unique indexes make receipt, output, dispatch and adjustment postings structurally once-only regardless of key construction; composite FKs tie each movement's item to its source line; exactly-one-source CHECK | `INSERT … ON CONFLICT (posting_key) DO NOTHING`; if a replay's payload differs from the stored row, fail loudly | `test_duplicate_posting_key_is_noop`, `test_replay_with_different_qty_raises`, `test_second_dispatch_for_line_rejected` |
 | 5 | No negative stock | **Backstop:** deferred constraint trigger asserts `SUM(qty_base) >= 0` for the item at commit | **Guarantee:** all writers take the item lock then check on-hand in `StockService.post()`, the only code path that inserts movements | `test_issue_over_on_hand_rejected`, `test_trigger_catches_unchecked_insert`, `test_concurrent_issues_never_go_negative` |
 | 6 | Reservations ≤ available | Same constraint trigger asserts `SUM(active reservations) <= on_hand` for finished items; `UNIQUE(order_line_id)`; composite FK keeps `item_id` equal to the order line's item | Approval computes availability under the item lock and either reserves all lines or none | `test_second_approval_goes_on_hold`, `test_reservation_trigger_rejects_overcommit`, `test_adjustment_cannot_drop_below_reserved` |
-| 7 | Payment allocation limits | Composite FKs force payment, allocation and invoice to the same customer. Deferred trigger asserts `Σ alloc(payment) ≤ payment.amount`, `Σ alloc(invoice, posted payments) ≤ invoice.grand_total`, and invoice `status='issued'` | Service locks the payment and invoice rows `FOR UPDATE` (ascending id), then re-checks | `test_allocation_exceeding_payment_rejected`, `test_allocation_exceeding_invoice_rejected`, `test_allocation_other_customer_rejected`, `test_reversed_payment_frees_invoice` |
+| 7 | Payment allocation limits | Composite FKs force payment, allocation and invoice to the same customer. Deferred trigger asserts `Σ alloc(payment) ≤ payment.amount`, `Σ alloc(invoice, posted payments) ≤ invoice.grand_total`, and invoice `status='issued'` | Service locks the payment and invoice rows `FOR UPDATE` (ascending id), then re-checks | `test_allocation_exceeding_payment_rejected`, `test_allocation_exceeding_invoice_rejected`, `test_allocation_other_customer_rejected_by_the_invoice_key` / `_by_the_payment_key`, `test_a_reversed_payment_frees_invoice_capacity` |
 | 8 | Valid state transitions (production, invoice, order, purchase, payment, reservation) | `status_transitions` table + one `BEFORE INSERT OR UPDATE` trigger on each workflow table rejects any edge not listed (§8). `CHECK`s tie status to its columns (e.g. `completed` ⇔ output and `completed_at` set). Posted-record guards (§5.1) freeze finished rows | Compare-and-set (`UPDATE … WHERE id=:id AND status=:expected`, rowcount 1) plus preconditions (stock, roles). A rowcount of 0 means "already done" or "invalid state" | `test_every_allowed_transition_succeeds`, `test_illegal_transitions_rejected` (parametrised), `test_complete_run_twice_rejected` |
 
 ### 5.1 The five trigger functions (all small, all tested)
 
 1. `forbid_mutation()`: rejects `UPDATE`/`DELETE` on `stock_movements`, `audit_log`, `credit_notes`, `invoice_lines`, `purchase_lines`.
-2. `guard_posted_row()`: `invoices` may change only `status`, `dispatched_at`, `dispatched_by`; `payments` only `status` and `reversed_*`; `production_runs` rejects any `UPDATE` once `status='completed'`; no `DELETE` on any document table.
+2. `guard_posted_row()`: `invoices` may change only `status`, `dispatched_at`, `dispatched_by`; `payments` are guarded separately by `guard_payment_row()` (migration 0006: only `status`, `reversed_at`, `reversed_by`, `reverse_reason`; a reversed payment is frozen); `production_runs` rejects any `UPDATE` once `status='completed'`; no `DELETE` on any document table.
 3. `enforce_status_transition()`: reads `status_transitions` for `TG_TABLE_NAME`.
 4. `assert_stock_invariants()` (constraint trigger, `DEFERRABLE INITIALLY DEFERRED`) on `stock_movements` and `stock_reservations`.
 5. `assert_allocation_limits()` (deferred constraint trigger) on `payment_allocations`.
 
-The application database role is also denied `UPDATE`/`DELETE`/`TRUNCATE` on the append-only tables.
+Intended deployment: the application database role is denied `UPDATE`/`DELETE`/`TRUNCATE` on the append-only tables. No migration creates that role separation (see 4.7.1).
 
-**Honest limit of triggers 4 and 5.** A deferred trigger runs at commit with a fresh snapshot. It reliably catches logic errors inside one transaction, and it catches most races, but two uncoordinated transactions that both pass their trigger before either commits could slip through. That is why the lock in §6 is the guarantee, and the trigger is a second net, not a replacement.
+**Honest limit of triggers 4 and 5.** A deferred trigger runs at commit with a fresh snapshot. As implemented (migrations 0005 and 0006) the stock and allocation triggers also lock the item, or the payment and invoice, row and refuse to run above READ COMMITTED, so uncoordinated writers are serialised at the final check (proved by real-connection race tests). It is still a second net, not a replacement: values and availability decisions are computed before commit, so the service lock in §6 remains the guarantee, and opposite lock orders can deadlock (one transaction is aborted).
 
 ## 6. How concurrent transactions cannot oversell
 
@@ -872,7 +892,7 @@ All run at `READ COMMITTED`: one transaction per use case, locks in document →
 | T9 | Dispatch | invoice, items | dispatch movements; reservation → `fulfilled`; invoice/order → `dispatched` | On-hand < qty |
 | T10 | Record payment | payment, invoices | payment, allocations | Allocation limits (§5 rule 7) |
 | T11 | Add or void overhead | run | `production_overheads` | n/a |
-| T12 | Cancel invoice | invoice, items | credit note; status; reservation release or dispatch reversal (R1) | Allocations exist |
+| T12 | Cancel invoice | payments (if reversed in the same transaction, locked first), invoice, items | credit note; status; reservation release or dispatch reversal (R1) | Allocations from posted payments exist (refused at COMMIT by `assert_invoice_not_settled`) |
 | T13 | Void purchase (cut-line) | purchase, items | reversal movements (R2); status | A later movement exists on any item |
 
 T3, T4 and T5 call `begin_request()` first (§7), inside the same transaction.

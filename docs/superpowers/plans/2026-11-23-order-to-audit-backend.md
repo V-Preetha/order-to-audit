@@ -224,6 +224,7 @@ The ledger migration (0005) enforces shape, sign, source agreement, one-shot pos
 | 16 | A purchase may be voided only if each receipt is the item's latest movement (design 9.6 rule R2); otherwise refuse with a clear error | `test_void_refused_when_later_movements_exist` |
 | 18 (sales cancellation) | Cancelling or rejecting an order releases its active reservations in the same transaction | `test_cancelling_an_order_releases_its_reservations` |
 | 19 (invoice cancellation) | Post a dispatch reversal exactly when the credit note's `restock` is true, and none when false | `test_restock_flag_decides_dispatch_reversal` |
+| 14 / 20 (audit and payment services) | Write the `audit_log` entry in the SAME transaction as the audited change; lock the payment and invoice rows `FOR UPDATE` in ascending id order before allocating; reverse a payment (never delete) before cancelling an invoice that has allocations | `test_audit_entry_is_written_in_the_same_transaction`; `test_payment_service_locks_payment_then_invoice_in_id_order`; `test_invoice_cancel_requires_payment_reversal_first` |
 | 17 (production service) | Completing a run posts the finished-goods output movement in the same transaction (a completed run without its output must be impossible) | `test_completing_a_run_posts_output_atomically` |
 
 ### Task 12: StockService — core posting, balances, WAC, idempotency

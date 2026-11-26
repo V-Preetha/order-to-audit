@@ -57,7 +57,10 @@ EXPECTED_TABLES_0004 = {"production_runs", "production_run_lines", "production_o
 EXPECTED_FUNCTIONS_0004 = {"guard_run_header", "check_run_insert", "assert_run_snapshot", "guard_run_line_insert", "guard_overhead"}
 EXPECTED_TABLES_0005 = {"purchases", "purchase_lines", "stock_adjustments", "stock_movements", "stock_reservations"}
 EXPECTED_FUNCTIONS_0005 = {"assert_stock_invariants", "assert_movement_source", "assert_source_posted", "assert_reservation_source", "guard_movement_insert",
-                           "guard_purchase_row", "guard_purchase_line_insert", "guard_reservation_row"}
+                           "guard_purchase_row", "guard_purchase_line_insert", "guard_reservation_row", "stamp_lifecycle"}
+EXPECTED_TABLES_0006 = {"payments", "payment_allocations", "audit_log"}
+EXPECTED_FUNCTIONS_0006 = {"guard_payment_row", "assert_allocation_limits", "assert_invoice_not_settled", "stamp_payment_lifecycle", "stamp_allocation_time",
+                           "stamp_audit_time"}
 EDGES_0001, EDGES_0002 = 22, 8
 ALL_EDGES = EDGES_0001 + EDGES_0002
 
@@ -176,3 +179,49 @@ def test_0005_downgrade_leaves_no_function_behind(fresh_url):
     finally:
         eng.dispose()
     assert leftovers == []
+
+
+def test_0006_can_be_reversed_alone_leaving_0005_intact(fresh_url):
+    cfg = alembic_config(fresh_url)
+    command.upgrade(cfg, "0005")
+    at_0005 = _inventory(fresh_url)
+    assert not (EXPECTED_TABLES_0006 & at_0005[0])
+
+    command.upgrade(cfg, "0006")
+    tables, functions, types, seeded = _inventory(fresh_url)
+    assert EXPECTED_TABLES_0006 <= tables and EXPECTED_FUNCTIONS_0006 <= functions and seeded == ALL_EDGES
+
+    command.downgrade(cfg, "0005")
+    assert _inventory(fresh_url) == at_0005, "downgrading 0006 must restore exactly the 0005 schema and seed"
+
+    command.upgrade(cfg, "head")
+    assert EXPECTED_TABLES_0006 <= _inventory(fresh_url)[0]
+
+
+def test_0006_downgrade_leaves_no_trigger_on_invoices_and_no_function_behind(fresh_url):
+    cfg = alembic_config(fresh_url)
+    command.upgrade(cfg, "0006")
+    command.downgrade(cfg, "0005")
+    eng = create_engine(fresh_url)
+    try:
+        with eng.connect() as conn:
+            triggers = conn.execute(text("SELECT tgname FROM pg_trigger WHERE tgrelid = 'invoices'::regclass AND tgname = 'trg_invoice_not_settled'")).scalars().all()
+            functions = conn.execute(text("SELECT proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND proname = ANY(:f)"),
+                                     {"f": sorted(EXPECTED_FUNCTIONS_0006)}).scalars().all()
+    finally:
+        eng.dispose()
+    assert triggers == [] and functions == []
+
+
+def test_0006_can_be_reapplied_after_a_downgrade_and_starts_empty(fresh_url):
+    """Documented behaviour: the downgrade drops the three tables (and any payments, allocations and audit entries in them)."""
+    cfg = alembic_config(fresh_url)
+    command.upgrade(cfg, "0006")
+    command.downgrade(cfg, "0005")
+    command.upgrade(cfg, "0006")
+    eng = create_engine(fresh_url)
+    try:
+        with eng.connect() as conn:
+            assert conn.execute(text("SELECT count(*) FROM payments")).scalar_one() == 0
+    finally:
+        eng.dispose()
