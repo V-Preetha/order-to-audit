@@ -357,13 +357,70 @@ def test_void_columns_must_agree_with_the_status(db_session, x, assignment):
         run(db_session, f"UPDATE purchases SET {assignment} WHERE id = :p", p=pid, u=x["u"])
 
 
-def test_a_void_cannot_predate_the_purchase(db_session, x):
+def test_the_void_time_is_stamped_by_the_database_not_taken_from_the_client(db_session, x):
+    """A client-supplied (backdated) voided_at is ignored: the stored value is the transaction time of the transition."""
     pid, _ = _purchase(db_session, x)
     db_session.commit()
-    with violates(db_session, pge.CheckViolation, "ck_purchases_voided_after_created"):
-        run(db_session, "UPDATE purchases SET status = 'voided', voided_at = created_at - interval '1 day', voided_by = :u, void_reason = 'x' WHERE id = :p",
-            u=x["u"], p=pid)
-    assert scalar(db_session, "SELECT count(*) FROM stock_movements") == 1
+    run(db_session, "UPDATE purchases SET status = 'voided', voided_at = created_at - interval '1 day', voided_by = :u, void_reason = 'x' WHERE id = :p",
+        u=x["u"], p=pid)
+    assert scalar(db_session, "SELECT voided_at = now() FROM purchases WHERE id = :p", p=pid) is True
+    assert scalar(db_session, "SELECT voided_at >= created_at FROM purchases WHERE id = :p", p=pid) is True
+
+
+def test_a_void_needs_no_client_timestamp(db_session, x):
+    pid, _ = _purchase(db_session, x)
+    db_session.commit()
+    run(db_session, "UPDATE purchases SET status = 'voided', voided_by = :u, void_reason = 'x' WHERE id = :p", u=x["u"], p=pid)
+    assert scalar(db_session, "SELECT voided_at = now() FROM purchases WHERE id = :p", p=pid) is True
+
+
+def test_the_close_time_is_stamped_by_the_database_not_taken_from_the_client(db_session, x):
+    _open(db_session, x, x["sku"], "238")
+    _, oline = _approved_line(db_session, x, "50")
+    rid = _reserve(db_session, x, oline, "50")
+    db_session.commit()
+    run(db_session, "UPDATE stock_reservations SET status = 'released', closed_at = timestamp '2000-01-01' WHERE id = :r", r=rid)
+    assert scalar(db_session, "SELECT closed_at = now() FROM stock_reservations WHERE id = :r", r=rid) is True
+
+
+def test_a_close_needs_no_client_timestamp(db_session, x):
+    _open(db_session, x, x["sku"], "238")
+    _, oline = _approved_line(db_session, x, "50")
+    rid = _reserve(db_session, x, oline, "50")
+    db_session.commit()
+    run(db_session, "UPDATE stock_reservations SET status = 'fulfilled' WHERE id = :r", r=rid)
+    assert scalar(db_session, "SELECT closed_at = now() FROM stock_reservations WHERE id = :r", r=rid) is True
+
+
+def test_creation_times_are_stamped_by_the_database(db_session, x):
+    """purchases, stock_reservations and stock_adjustments cannot be inserted with a backdated created_at."""
+    n = next(_n)
+    run(db_session, "INSERT INTO purchases (purchase_no, supplier_id, supplier_invoice_no, purchase_date, created_by, created_at) "
+                    "VALUES (:no, :s, :si, :d, :u, timestamp '2001-01-01')", no=f"PUR/T{n}", s=x["sup"], si=f"SI-T{n}", d=D0, u=x["u"])
+    assert scalar(db_session, "SELECT created_at = now() FROM purchases WHERE purchase_no = :no", no=f"PUR/T{n}") is True
+    run(db_session, "INSERT INTO stock_adjustments (adjustment_no, kind, item_id, item_kind, qty_delta_base, unit_cost, reason, adjustment_date, created_by, created_at) "
+                    "SELECT :no, 'opening', id, kind, 5, 42, 'open', :d, :u, timestamp '2001-01-01' FROM items WHERE id = :i", no=f"ADJ-T{n}", d=D0, u=x["u"], i=x["flour"])
+    assert scalar(db_session, "SELECT created_at = now() FROM stock_adjustments WHERE adjustment_no = :no", no=f"ADJ-T{n}") is True
+    _, oline = _approved_line(db_session, x, "50")
+    run(db_session, "INSERT INTO stock_reservations (order_line_id, item_id, qty_base, created_by, created_at) VALUES (:o, :i, 1, :u, timestamp '2001-01-01')",
+        o=oline, i=x["sku"], u=x["ada"])
+    assert scalar(db_session, "SELECT created_at = now() FROM stock_reservations WHERE order_line_id = :o", o=oline) is True
+
+
+def test_business_dates_stay_as_the_user_entered_them(db_session, x):
+    """Only audit timestamps are stamped; purchase_date and adjustment_date are business dates and keep their backdated values."""
+    old = date(2020, 4, 1)
+    pid, _ = _purchase(db_session, x, purchase_date=old)
+    assert scalar(db_session, "SELECT purchase_date FROM purchases WHERE id = :p", p=pid) == old
+    adj = _adj(db_session, x, x["oil"], "5", "140", on=old)
+    assert scalar(db_session, "SELECT adjustment_date FROM stock_adjustments WHERE id = :a", a=adj) == old
+
+
+def test_stamped_times_cannot_be_rewritten_later(db_session, x):
+    pid, _ = _purchase(db_session, x)
+    db_session.commit()
+    with violates(db_session, pge.RestrictViolation, message="cannot be changed"):
+        run(db_session, "UPDATE purchases SET created_at = timestamp '2001-01-01' WHERE id = :p", p=pid)
 
 
 # ================================================================ stock adjustments
@@ -1075,8 +1132,7 @@ def test_reservation_status_and_closed_at_agree(db_session, x):
     _, oline = _approved_line(db_session, x, "50")
     rid = _reserve(db_session, x, oline, "50")
     db_session.commit()
-    with violates(db_session, pge.CheckViolation, "ck_stock_reservations_closed"):
-        run(db_session, "UPDATE stock_reservations SET status = 'released' WHERE id = :r", r=rid)
+    # closing without a timestamp is fine now (the database stamps it); a timestamp on a reservation that stays active is not
     with violates(db_session, pge.CheckViolation, "ck_stock_reservations_closed"):
         run(db_session, "UPDATE stock_reservations SET closed_at = now() WHERE id = :r", r=rid)
 

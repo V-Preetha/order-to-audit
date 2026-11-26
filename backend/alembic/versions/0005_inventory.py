@@ -33,7 +33,7 @@ branch_labels = None
 depends_on = None
 
 FUNCTIONS = ("assert_stock_invariants", "assert_movement_source", "assert_source_posted", "assert_reservation_source",
-             "guard_movement_insert", "guard_purchase_row", "guard_purchase_line_insert", "guard_reservation_row")
+             "guard_movement_insert", "guard_purchase_row", "guard_purchase_line_insert", "guard_reservation_row", "stamp_lifecycle")
 
 
 def _sql(statement: str) -> None:
@@ -287,6 +287,25 @@ def upgrade() -> None:
     END
     $$""")
 
+    # Audit timestamps belong to the database: creation time on insert, void time on posted->voided, close time on active->closed.
+    # A client-supplied value is overwritten, never trusted, so history cannot be backdated. Business dates (purchase_date,
+    # adjustment_date, movement_date) are NOT touched. Runs after trg_2_guard, so a terminal row is already frozen.
+    _sql("""
+    CREATE FUNCTION stamp_lifecycle() RETURNS trigger LANGUAGE plpgsql
+    SET search_path = public, pg_temp
+    AS $$
+    BEGIN
+      IF TG_OP = 'INSERT' THEN
+        NEW.created_at := now();
+      ELSIF TG_TABLE_NAME = 'purchases' AND OLD.status = 'posted' AND NEW.status = 'voided' THEN
+        NEW.voided_at := now();
+      ELSIF TG_TABLE_NAME = 'stock_reservations' AND OLD.status = 'active' AND NEW.status <> 'active' THEN
+        NEW.closed_at := now();
+      END IF;
+      RETURN NEW;
+    END
+    $$""")
+
     # A reversal is the exact mirror of one earlier movement and is itself never reversed. Item agreement is left to the
     # composite foreign key, so a wrong item is reported as the foreign-key violation it is.
     _sql("""
@@ -504,6 +523,9 @@ def upgrade() -> None:
     # ------------------------------------------------------------------ triggers (names sort in firing order)
     _sql("CREATE TRIGGER trg_1_status BEFORE INSERT OR UPDATE ON purchases FOR EACH ROW EXECUTE FUNCTION enforce_status_transition()")
     _sql("CREATE TRIGGER trg_2_guard BEFORE UPDATE OR DELETE ON purchases FOR EACH ROW EXECUTE FUNCTION guard_purchase_row()")
+    _sql("CREATE TRIGGER trg_3_stamp BEFORE INSERT OR UPDATE ON purchases FOR EACH ROW EXECUTE FUNCTION stamp_lifecycle()")
+    _sql("CREATE TRIGGER trg_3_stamp BEFORE INSERT OR UPDATE ON stock_reservations FOR EACH ROW EXECUTE FUNCTION stamp_lifecycle()")
+    _sql("CREATE TRIGGER trg_3_stamp BEFORE INSERT ON stock_adjustments FOR EACH ROW EXECUTE FUNCTION stamp_lifecycle()")
     _sql("CREATE TRIGGER trg_late_line BEFORE INSERT ON purchase_lines FOR EACH ROW EXECUTE FUNCTION guard_purchase_line_insert()")
     _sql("CREATE TRIGGER trg_1_status BEFORE INSERT OR UPDATE ON stock_reservations FOR EACH ROW EXECUTE FUNCTION enforce_status_transition()")
     _sql("CREATE TRIGGER trg_2_guard BEFORE UPDATE OR DELETE ON stock_reservations FOR EACH ROW EXECUTE FUNCTION guard_reservation_row()")
